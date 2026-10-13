@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+// Compile-time generated Q16.16 ROMs. Exact rational grid expressions avoid
+// host floating-point literals; quantization is nearest-even and saturating.
+
+fn ztpu_lut_recip_value<I>() -> u32 {
+    bitcast<u32>(quantize<fixed<32,16>>(
+        sqrt(1) / ((sqrt(1) / 2) + ((2 * I + 1) * sqrt(1) / 1024))
+    ) {
+        round nearest_even overflow saturate
+    })
+}
+
+fn ztpu_lut_rsqrt_value<I>() -> u32 {
+    bitcast<u32>(quantize<fixed<32,16>>(
+        sqrt(1) / sqrt((sqrt(1) / 2) + ((2 * I + 1) * sqrt(1) / 1024))
+    ) {
+        round nearest_even overflow saturate
+    })
+}
+
+fn ztpu_lut_exp_value<I>() -> u32 {
+    bitcast<u32>(quantize<fixed<32,16>>(exp(-(I * sqrt(1) / 128))) {
+        round nearest_even overflow saturate
+    })
+}
+
+fn ztpu_lut_ln_value<I>() -> u32 {
+    bitcast<u32>(quantize<fixed<32,16>>(
+        log(exp(1), (sqrt(1) / 2) + ((2 * I + 1) * sqrt(1) / 1024))
+    ) {
+        round nearest_even overflow saturate
+    })
+}
+
+module ZtpuReciprocalSeedLutQ16 {
+    clock clk reset rst
+    in request : bit
+    in address : u8
+    out data : u32
+    out reg data_valid : bit = 0
+    rom table : rom<u32,256> {
+        read_latency 1
+        init generate(i in 0..256) ztpu_lut_recip_value<I=i>()
+    }
+    table.read_address = address
+    data_valid <- request
+    data = table.read_data
+}
+
+module ZtpuRsqrtSeedLutQ16 {
+    clock clk reset rst
+    in request : bit
+    in address : u8
+    out data : u32
+    out reg data_valid : bit = 0
+    rom table : rom<u32,256> {
+        read_latency 1
+        init generate(i in 0..256) ztpu_lut_rsqrt_value<I=i>()
+    }
+    table.read_address = address
+    data_valid <- request
+    data = table.read_data
+}
+
+module ZtpuExpNegLutQ16 {
+    clock clk reset rst
+    in request : bit
+    in address : u10
+    out data : u32
+    out reg data_valid : bit = 0
+    rom table : rom<u32,1024> {
+        read_latency 1
+        init generate(i in 0..1024) ztpu_lut_exp_value<I=i>()
+    }
+    table.read_address = address
+    data_valid <- request
+    data = table.read_data
+}
+
+module ZtpuLnMantissaLutQ16 {
+    clock clk reset rst
+    in request : bit
+    in address : u8
+    out data : u32
+    out reg data_valid : bit = 0
+    rom table : rom<u32,256> {
+        read_latency 1
+        init generate(i in 0..256) ztpu_lut_ln_value<I=i>()
+    }
+    table.read_address = address
+    data_valid <- request
+    data = table.read_data
+}

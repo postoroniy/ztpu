@@ -1,0 +1,14 @@
+schema = 1
+
+[project]
+name = "ztpu"
+version = "0.1.0-alpha.1"
+source-root = "src"
+
+# Canonical, target-neutral compilation policy for the source release. Physical
+# implementation constraints are intentionally outside this release profile.
+[profiles.portable]
+backend = "systemverilog"
+backend-mode = "required"
+formal-policy = "off"
+evidence-policy = "estimate_only"

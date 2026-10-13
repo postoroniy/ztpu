@@ -1,0 +1,1055 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.scheduler
+import std.bus.ahb_lite
+import std.bus.apb
+import std.bus.reg
+import std.storage.core
+
+struct ZtpuCfgCommandStatus {
+    ready : bit
+    accept : bit
+    count : u3
+    last_done : u8
+}
+struct ZtpuCfgCommandDmaStatus {
+    busy : bit
+    done : bit
+    error : bit
+    error_code : u4
+    fetched_count : uint<24>
+}
+
+struct ZtpuCfgCompletionStatus {
+    valid : bit
+    tag : u8
+    opcode : u4
+    status : u4
+    error : u8
+    count : u4
+    overflow : bit
+}
+
+struct ZtpuCfgFenceFaultStatus {
+    valid : bit
+    overflow : bit
+    write : bit
+    master : u4
+    addr_low : u32
+    addr_high : u32
+    len : u8
+    size : u3
+}
+
+struct ZtpuCfgPerfStatus {
+    cycles : u32
+    busy_cycles : u32
+    command_count : u32
+    dma_read_count : u32
+    dma_write_count : u32
+    error_count : u32
+    error_valid : bit
+    error_code : u8
+}
+
+struct ZtpuCfgZeroSkipStatus {
+    steps : u32
+    total_macs : u32
+    active_macs : u32
+    skipped_macs : u32
+}
+
+struct ZtpuCfgLayoutStatus {
+    valid : bit
+    done : bit
+    error : bit
+    in_address_low : u32
+    in_address_high : u32
+    out_address_low : u32
+    out_address_high : u32
+    tiler_valid : bit
+    tiler_done : bit
+}
+
+struct ZtpuCfgUbDmaStatus {
+    busy : bit
+    done : bit
+    error : bit
+    error_code : u8
+}
+
+struct ZtpuCfgEngineStatus {
+    busy : bit
+    done : bit
+    error : bit
+}
+
+struct ZtpuCfgAdamStatus {
+    engine : ZtpuCfgEngineStatus
+    beta1_power : bits<32>
+    beta2_power : bits<32>
+}
+
+struct ZtpuCfgDirectStatus {
+    dma : ZtpuCfgUbDmaStatus
+    mxu : ZtpuCfgEngineStatus
+    adam : ZtpuCfgAdamStatus
+    vmu : ZtpuCfgEngineStatus
+}
+
+struct ZtpuCfgCommandDebug {
+    valid : bit
+    address_low : u32
+    auxiliary_low : u32
+    length : u16
+    opcode : u4
+}
+
+struct ZtpuCfgUbDmaDebug {
+    launch_pending : bit
+    capture_armed : bit
+    capture_ok : bit
+    capture : bit
+    start : bit
+    launch_dram_low : u32
+    launch_ub_low : u32
+    launch_length : u32
+    start_seen : bit
+    start_store : bit
+    start_dram_low : u32
+    start_ub_low : u32
+    start_length : u32
+}
+
+struct ZtpuCfgQueueDebug {
+    push : ZtpuCfgCommandDebug
+    head : ZtpuCfgCommandDebug
+    empty : bit
+    current_head_valid : bit
+    head_pointer : u16
+    tail_pointer : u16
+    count : u16
+}
+
+struct ZtpuCfgDebugStatus {
+    command_output : ZtpuCfgCommandDebug
+    ub_dma : ZtpuCfgUbDmaDebug
+    config_command : ZtpuCfgCommandDebug
+    command_input : ZtpuCfgCommandDebug
+    queue : ZtpuCfgQueueDebug
+}
+
+fn empty_cfg_command_debug() -> ZtpuCfgCommandDebug {
+    ZtpuCfgCommandDebug {
+        valid = 0 address_low = 0 auxiliary_low = 0 length = 0 opcode = 0
+    }
+}
+
+fn empty_cfg_debug_status() -> ZtpuCfgDebugStatus {
+    ZtpuCfgDebugStatus {
+        command_output = empty_cfg_command_debug()
+        ub_dma = ZtpuCfgUbDmaDebug {
+            launch_pending = 0 capture_armed = 0 capture_ok = 0 capture = 0
+            start = 0 launch_dram_low = 0 launch_ub_low = 0 launch_length = 0
+            start_seen = 0 start_store = 0 start_dram_low = 0 start_ub_low = 0
+            start_length = 0
+        }
+        config_command = empty_cfg_command_debug()
+        command_input = empty_cfg_command_debug()
+        queue = ZtpuCfgQueueDebug {
+            push = empty_cfg_command_debug() head = empty_cfg_command_debug()
+            empty = 0 current_head_valid = 0
+            head_pointer = 0 tail_pointer = 0 count = 0
+        }
+    }
+}
+
+fn empty_cfg_status() -> ZtpuCfgStatus {
+    ZtpuCfgStatus {
+        direct = ZtpuCfgDirectStatus {
+            dma = ZtpuCfgUbDmaStatus {
+                busy = 0 done = 0 error = 0 error_code = 0
+            }
+            mxu = ZtpuCfgEngineStatus { busy = 0 done = 0 error = 0 }
+            adam = ZtpuCfgAdamStatus {
+                engine = ZtpuCfgEngineStatus { busy = 0 done = 0 error = 0 }
+                beta1_power = 0 beta2_power = 0
+            }
+            vmu = ZtpuCfgEngineStatus { busy = 0 done = 0 error = 0 }
+        }
+        command = ZtpuCfgCommandStatus {
+            ready = 0 accept = 0 count = 0 last_done = 0
+        }
+        command_dma = ZtpuCfgCommandDmaStatus {
+            busy = 0 done = 0 error = 0 error_code = 0 fetched_count = 0
+        }
+        completion = ZtpuCfgCompletionStatus {
+            valid = 0 tag = 0 opcode = 0 status = 0 error = 0
+            count = 0 overflow = 0
+        }
+        fault = ZtpuCfgFenceFaultStatus {
+            valid = 0 overflow = 0 write = 0 master = 0
+            addr_low = 0 addr_high = 0 len = 0 size = 0
+        }
+        perf = ZtpuCfgPerfStatus {
+            cycles = 0 busy_cycles = 0 command_count = 0
+            dma_read_count = 0 dma_write_count = 0 error_count = 0
+            error_valid = 0 error_code = 0
+        }
+        zero_skip = ZtpuCfgZeroSkipStatus {
+            steps = 0 total_macs = 0 active_macs = 0 skipped_macs = 0
+        }
+        layout = ZtpuCfgLayoutStatus {
+            valid = 0 done = 0 error = 0
+            in_address_low = 0 in_address_high = 0
+            out_address_low = 0 out_address_high = 0
+            tiler_valid = 0 tiler_done = 0
+        }
+        debug = empty_cfg_debug_status()
+    }
+}
+
+struct ZtpuCfgStatus {
+    direct : ZtpuCfgDirectStatus
+    command : ZtpuCfgCommandStatus
+    command_dma : ZtpuCfgCommandDmaStatus
+    completion : ZtpuCfgCompletionStatus
+    fault : ZtpuCfgFenceFaultStatus
+    perf : ZtpuCfgPerfStatus
+    zero_skip : ZtpuCfgZeroSkipStatus
+    layout : ZtpuCfgLayoutStatus
+    debug : ZtpuCfgDebugStatus
+}
+
+struct ZtpuCfgCommandDmaControl {
+    start : bit
+    clear : bit
+    base : u64
+    count : uint<24>
+}
+
+struct ZtpuCfgCompletionControl {
+    enable : bit
+    clear : bit
+    pop : bit
+    irq_enable : bit
+}
+
+struct ZtpuCfgFenceWindow {
+    enable : bit
+    base : u64
+    limit : u64
+}
+
+struct ZtpuCfgFenceControl {
+    global_window : ZtpuCfgFenceWindow
+    ub_window : ZtpuCfgFenceWindow
+    ub_read_window : ZtpuCfgFenceWindow
+    ub_write_window : ZtpuCfgFenceWindow
+    clear_valid : bit
+    clear_overflow : bit
+}
+
+struct ZtpuCfgUbDmaControl {
+    enable : bit
+    start : bit
+    store : bit
+    dram_base : u64
+    ub_base : u64
+    length : bits<32>
+}
+
+struct ZtpuCfgMxuControl {
+    enable : bit
+    start : bit
+    accumulate : bit
+    clear_accumulator : bit
+    spill : bit
+    restore : bit
+    a_base : u64
+    b_base : u64
+    c_base : u64
+    accumulator_base : u64
+    a_stride : u32
+    b_stride : u32
+    k_dim : bits<32>
+    requant_enable : bit
+    requant_scale : bits<32>
+    requant_shift : u8
+    requant_zero : bits<32>
+    mode : u3
+    transpose_a : bit
+    transpose_b : bit
+    zero_skip_a : bit
+    zero_skip_b : bit
+}
+
+struct ZtpuCfgAdamControl {
+    enable : bit
+    start : bit
+    clear : bit
+    weight_base : u64
+    gradient_base : u64
+    moment_base : u64
+    variance_base : u64
+    length : bits<32>
+    learning_rate : bits<32>
+    beta1 : bits<32>
+    beta2 : bits<32>
+    epsilon : bits<32>
+}
+
+struct ZtpuCfgVmuControl {
+    enable : bit
+    start : bit
+    operation : u4
+    source0_base : u64
+    source1_base : u64
+    destination_base : u64
+    length : bits<32>
+    scalar0 : bits<32>
+    scalar1 : bits<32>
+    scalar2 : bits<32>
+    scalar3 : bits<32>
+}
+
+struct ZtpuCfgDirectControl {
+    dma : ZtpuCfgUbDmaControl
+    mxu : ZtpuCfgMxuControl
+    adam : ZtpuCfgAdamControl
+    vmu : ZtpuCfgVmuControl
+}
+
+struct ZtpuCfgPerfControl {
+    enable : bit
+    clear : bit
+    clear_error : bit
+}
+
+struct ZtpuCfgLayoutControl {
+    start : bit
+    dma_enable : bit
+    source_tiler : bit
+    layout_in : u2
+    layout_out : u2
+    base_in : u64
+    base_out : u64
+    in_stride_n : u32
+    in_stride_c : u32
+    in_stride_h : u32
+    in_stride_w : u32
+    in_stride_cb : u32
+    out_stride_n : u32
+    out_stride_c : u32
+    out_stride_h : u32
+    out_stride_w : u32
+    out_stride_cb : u32
+    n_dim : u3
+    c_dim : u7
+    h_dim : u7
+    w_dim : u7
+    tiler_start : bit
+    tiler_ready : bit
+    tiler_base : u64
+    tiler_row_stride : u32
+    tiler_col_stride : u32
+    tiler_rows : u9
+    tiler_cols : u9
+    layout_fence : ZtpuCfgFenceWindow
+    read_fence : ZtpuCfgFenceWindow
+    write_fence : ZtpuCfgFenceWindow
+}
+
+struct ZtpuCfgControl {
+    direct : ZtpuCfgDirectControl
+    command_push : bit
+    live_command : ZtpuCommand
+    live_length : bits<32>
+    queued_valid : bit
+    queued_command : ZtpuCommand
+    command_dma : ZtpuCfgCommandDmaControl
+    completion : ZtpuCfgCompletionControl
+    fence : ZtpuCfgFenceControl
+    perf : ZtpuCfgPerfControl
+    layout : ZtpuCfgLayoutControl
+}
+
+// Compiler-owned register banks are authoritative for the complete live host
+// map. The 0x300 split stays below ZLang's bounded 256-register expansion per
+// bank; split fields, pulses, read-only status, and write events remain native
+// CSR declarations rather than hand-written address decoders.
+module ZtpuCsrBank64x32 {
+    clock clk reset rst
+    in status : ZtpuCfgStatus
+    out fault_clear : bits<2>
+    out adam_clear : bit
+
+    csr group FENCE_WINDOW {
+        CTRL @ 0x00 { enable bit @0 rw = 0 }
+        BASE @ 0x04 split<32> value u64 rw = 0 order low_first
+        LIMIT @ 0x0c split<32> value u64 rw = 0 order low_first
+    }
+
+    csr registers @ 0 {
+        ID @ 0x0000 { value u32 @31:0 ro = 0x5a545055 }
+        VERSION @ 0x0004 { value u32 @31:0 ro = 1 }
+        CAPABILITY0 @ 0x0008 { value u32 @31:0 ro = 0x00100202 }
+        CAPABILITY1 @ 0x000c { value u32 @31:0 ro = 0x00400020 }
+
+        PERF_CTRL @ 0x0060 {
+            enable bit @0 rw = 0
+            clear bit @1 pulse
+            clear_error bit @2 pulse
+        }
+        PERF_CYCLES @ 0x0064 { value u32 @31:0 ro <- status.perf.cycles }
+        PERF_BUSY @ 0x0068 { value u32 @31:0 ro <- status.perf.busy_cycles }
+        PERF_COMMANDS @ 0x006c { value u32 @31:0 ro <- status.perf.command_count }
+        PERF_DMA_READS @ 0x0070 { value u32 @31:0 ro <- status.perf.dma_read_count }
+        PERF_DMA_WRITES @ 0x0074 { value u32 @31:0 ro <- status.perf.dma_write_count }
+        PERF_ERRORS @ 0x0078 { value u32 @31:0 ro <- status.perf.error_count }
+        PERF_ERROR @ 0x007c {
+            valid bit @0 ro <- status.perf.error_valid
+            code u8 @8:1 ro <- status.perf.error_code
+        }
+
+        LAYOUT_CTRL @ 0x0080 {
+            start bit @0 pulse
+            dma_enable bit @1 rw = 0
+            source_tiler bit @2 rw = 0
+        }
+        LAYOUT_CFG @ 0x0084 {
+            layout_in u2 @1:0 rw = 0
+            layout_out u2 @3:2 rw = 0
+        }
+        LAYOUT_BASE_IN @ 0x0088 split<32> value u64 rw = 0 order low_first
+        LAYOUT_BASE_OUT @ 0x0090 split<32> value u64 rw = 0 order low_first
+        LAYOUT_IN_STRIDE_N @ 0x0098 { value u32 @31:0 rw = 0 }
+        LAYOUT_IN_STRIDE_C @ 0x009c { value u32 @31:0 rw = 0 }
+        LAYOUT_IN_STRIDE_H @ 0x00a0 { value u32 @31:0 rw = 0 }
+        LAYOUT_IN_STRIDE_W @ 0x00a4 { value u32 @31:0 rw = 0 }
+        LAYOUT_IN_STRIDE_CB @ 0x00a8 { value u32 @31:0 rw = 0 }
+        LAYOUT_OUT_STRIDE_N @ 0x00ac { value u32 @31:0 rw = 0 }
+        LAYOUT_OUT_STRIDE_C @ 0x00b0 { value u32 @31:0 rw = 0 }
+        LAYOUT_OUT_STRIDE_H @ 0x00b4 { value u32 @31:0 rw = 0 }
+        LAYOUT_OUT_STRIDE_W @ 0x00b8 { value u32 @31:0 rw = 0 }
+        LAYOUT_OUT_STRIDE_CB @ 0x00bc { value u32 @31:0 rw = 0 }
+        LAYOUT_N_DIM @ 0x00c0 { value u3 @2:0 rw = 0 }
+        LAYOUT_C_DIM @ 0x00c4 { value u7 @6:0 rw = 0 }
+        LAYOUT_H_DIM @ 0x00c8 { value u7 @6:0 rw = 0 }
+        LAYOUT_W_DIM @ 0x00cc { value u7 @6:0 rw = 0 }
+        LAYOUT_STATUS @ 0x00d0 {
+            valid bit @0 ro <- status.layout.valid
+            done bit @1 ro <- status.layout.done
+            error bit @2 ro <- status.layout.error
+        }
+        LAYOUT_IN_ADDR_LO @ 0x00d4 { value u32 @31:0 ro <- status.layout.in_address_low }
+        LAYOUT_IN_ADDR_HI @ 0x00d8 { value u32 @31:0 ro <- status.layout.in_address_high }
+        LAYOUT_OUT_ADDR_LO @ 0x00dc { value u32 @31:0 ro <- status.layout.out_address_low }
+        LAYOUT_OUT_ADDR_HI @ 0x00e0 { value u32 @31:0 ro <- status.layout.out_address_high }
+
+        COMMAND_PUSH @ 0x00e4 { push bit @0 pulse }
+        COMMAND_OPCODE @ 0x00e8 { value bits<4> @3:0 rw = 0 }
+        COMMAND_ADDRESS @ 0x00ec split<32> value u64 rw = 0 order low_first
+        COMMAND_LENGTH @ 0x00f4 { value bits<32> @31:0 rw = 0 }
+        COMMAND_TAG @ 0x00f8 { value u8 @7:0 rw = 0 }
+        COMMAND_DEPENDENCY_TAG @ 0x00fc { value u8 @7:0 rw = 0 }
+        COMMAND_STATUS @ 0x0100 {
+            ready bit @0 ro <- status.command.ready
+            count u3 @3:1 ro <- status.command.count
+            last_done u8 @16:9 ro <- status.command.last_done
+        }
+
+        TILER_CTRL @ 0x0150 {
+            start bit @0 pulse
+            ready bit @1 rw = 0
+        }
+        TILER_BASE @ 0x0154 split<32> value u64 rw = 0 order low_first
+        TILER_ROW_STRIDE @ 0x015c { value u32 @31:0 rw = 0 }
+        TILER_COL_STRIDE @ 0x0160 { value u32 @31:0 rw = 0 }
+        TILER_ROWS @ 0x0164 { value u9 @8:0 rw = 0 }
+        TILER_COLS @ 0x0168 { value u9 @8:0 rw = 0 }
+        TILER_STATUS @ 0x016c {
+            valid bit @0 ro <- status.layout.tiler_valid
+            done bit @1 ro <- status.layout.tiler_done
+        }
+
+        UB_DMA_CTRL @ 0x0190 {
+            enable bit @0 rw = 0
+            start bit @1 pulse
+            store bit @2 rw = 0
+        }
+        UB_DMA_DRAM_BASE @ 0x0194 split<32> value u64 rw = 0 order low_first
+        UB_DMA_UB_BASE @ 0x019c split<32> value u64 rw = 0 order low_first
+        UB_DMA_LENGTH @ 0x01a4 { value bits<32> @31:0 rw = 0 }
+        UB_DMA_STATUS @ 0x01a8 {
+            busy bit @0 ro <- status.direct.dma.busy
+            done bit @1 ro <- status.direct.dma.done
+            error bit @2 ro <- status.direct.dma.error
+            error_code u8 @10:3 ro <- status.direct.dma.error_code
+        }
+
+        UB_MXU_CTRL @ 0x01b0 {
+            enable bit @0 rw = 0
+            start bit @1 pulse
+            accumulate bit @2 rw = 0
+            clear_accumulator bit @3 rw = 0
+            spill bit @4 rw = 0
+            restore bit @5 rw = 0
+        }
+        UB_MXU_A_BASE @ 0x01b4 split<32> value u64 rw = 0 order low_first
+        UB_MXU_B_BASE @ 0x01bc split<32> value u64 rw = 0 order low_first
+        UB_MXU_C_BASE @ 0x01c4 split<32> value u64 rw = 0 order low_first
+        UB_MXU_K_DIM @ 0x01cc { value bits<32> @31:0 rw = 0 }
+        UB_MXU_STATUS @ 0x01d0 {
+            busy bit @0 ro <- status.direct.mxu.busy
+            done bit @1 ro <- status.direct.mxu.done
+            error bit @2 ro <- status.direct.mxu.error
+        }
+        COMMAND_AUXILIARY @ 0x01d4 split<32> value u64 rw = 0 order low_first
+        UB_MXU_ACC_BASE @ 0x01dc split<32> value u64 rw = 0 order low_first
+        UB_MXU_REQUANT_CTRL @ 0x01e4 { enable bit @0 rw = 0 }
+        UB_MXU_REQUANT_SCALE @ 0x01e8 { value bits<32> @31:0 rw = 0 }
+        UB_MXU_REQUANT_SHIFT @ 0x01ec { value u8 @7:0 rw = 0 }
+        UB_MXU_REQUANT_ZERO @ 0x01f0 { value bits<32> @31:0 rw = 0 }
+        UB_MXU_MODE @ 0x01f4 { value u3 @2:0 rw = 0 }
+        UB_MXU_A_STRIDE @ 0x01f8 { value u32 @31:0 rw = 0 }
+        UB_MXU_B_STRIDE @ 0x01fc { value u32 @31:0 rw = 0 }
+
+        COMPLETION_CTRL @ 0x0200 {
+            enable bit @0 rw = 1
+            clear bit @1 pulse
+            irq_enable bit @2 rw = 0
+        }
+        COMPLETION_STATUS @ 0x0204 {
+            count u4 @3:0 ro <- status.completion.count
+            overflow bit @8 ro <- status.completion.overflow
+        }
+        COMPLETION_HEAD @ 0x0208 {
+            tag u8 @7:0 ro <- status.completion.tag
+            opcode u4 @11:8 ro <- status.completion.opcode
+            status_value u4 @15:12 ro <- status.completion.status
+            error u8 @23:16 ro <- status.completion.error
+            valid bit @24 ro <- status.completion.valid
+        }
+        COMPLETION_POP @ 0x020c { pop bit @0 pulse }
+
+        global_fence : FENCE_WINDOW[1] @ 0x0210 stride 0x14
+        domain_fences : FENCE_WINDOW[2] @ 0x0238 stride 0x14
+        master_fences : FENCE_WINDOW[4] @ 0x02c4 stride 0x14
+    }
+
+    csr extended @ 0x0300 {
+        ZERO_SKIP_CTRL @ 0x0014 { value bits<2> @1:0 rw = 0 }
+        ZERO_SKIP_STEPS @ 0x0018 { value u32 @31:0 ro <- status.zero_skip.steps }
+        ZERO_SKIP_TOTAL @ 0x001c { value u32 @31:0 ro <- status.zero_skip.total_macs }
+        ZERO_SKIP_ACTIVE @ 0x0020 { value u32 @31:0 ro <- status.zero_skip.active_macs }
+        ZERO_SKIP_SKIPPED @ 0x0024 { value u32 @31:0 ro <- status.zero_skip.skipped_macs }
+
+        DIRECT_ADAM_CTRL @ 0x0028 {
+            enable bit @0 rw = 0
+            start bit @1 pulse
+            clear_config bit @2 rw = 0
+            clear_write bit @2 on_write post_accept -> adam_clear
+        }
+        DIRECT_ADAM_STATUS @ 0x002c {
+            busy bit @0 ro <- status.direct.adam.engine.busy
+            done bit @1 ro <- status.direct.adam.engine.done
+            error bit @2 ro <- status.direct.adam.engine.error
+        }
+        DIRECT_ADAM_W_BASE @ 0x0030 split<32> value u64 rw = 0 order low_first
+        DIRECT_ADAM_G_BASE @ 0x0038 split<32> value u64 rw = 0 order low_first
+        COMMAND_ADAM_M_BASE @ 0x0040 split<32> value u64 rw = 0 order low_first
+        COMMAND_ADAM_V_BASE @ 0x0048 split<32> value u64 rw = 0 order low_first
+        DIRECT_ADAM_LENGTH @ 0x0050 { value bits<32> @31:0 rw = 0 }
+        COMMAND_ADAM_LR @ 0x0054 { value bits<32> @31:0 rw = 0 }
+        COMMAND_ADAM_BETA1 @ 0x0058 { value bits<32> @31:0 rw = 0 }
+        COMMAND_ADAM_BETA2 @ 0x005c { value bits<32> @31:0 rw = 0 }
+        COMMAND_ADAM_EPS @ 0x0060 { value bits<32> @31:0 rw = 0 }
+        DIRECT_ADAM_BETA1_POWER @ 0x0064 {
+            value bits<32> @31:0 ro <- status.direct.adam.beta1_power
+        }
+        DIRECT_ADAM_BETA2_POWER @ 0x0068 {
+            value bits<32> @31:0 ro <- status.direct.adam.beta2_power
+        }
+
+        UB_VMU_CTRL @ 0x006c {
+            enable bit @0 rw = 0
+            start bit @1 pulse
+        }
+        UB_VMU_OPERATION @ 0x0070 { value u4 @3:0 rw = 0 }
+        UB_VMU_SOURCE1_BASE @ 0x0074 split<32> value u64 rw = 0 order low_first
+        UB_VMU_SCALAR0 @ 0x007c { value bits<32> @31:0 rw = 0 }
+        UB_VMU_SCALAR1 @ 0x0080 { value bits<32> @31:0 rw = 0 }
+        UB_VMU_SCALAR2 @ 0x0084 { value bits<32> @31:0 rw = 0 }
+        UB_VMU_SCALAR3 @ 0x0088 { value bits<32> @31:0 rw = 0 }
+        UB_VMU_STATUS @ 0x008c {
+            busy bit @0 ro <- status.direct.vmu.busy
+            done bit @1 ro <- status.direct.vmu.done
+            error bit @2 ro <- status.direct.vmu.error
+        }
+        UB_VMU_SOURCE0_BASE @ 0x0090 split<32> value u64 rw = 0 order low_first
+        UB_VMU_DESTINATION_BASE @ 0x0098 split<32> value u64 rw = 0 order low_first
+        UB_VMU_LENGTH @ 0x00a0 { value bits<32> @31:0 rw = 0 }
+
+        COMMAND_SRC1_BASE @ 0x00a4 split<32> value u64 rw = 0 order low_first
+        COMMAND_SCALAR0 @ 0x00ac { value bits<32> @31:0 rw = 0 }
+        COMMAND_SCALAR1 @ 0x00b0 { value bits<32> @31:0 rw = 0 }
+        COMMAND_SCALAR2 @ 0x00b4 { value bits<32> @31:0 rw = 0 }
+        COMMAND_SCALAR3 @ 0x00b8 { value bits<32> @31:0 rw = 0 }
+        UB_MXU_TRANSPOSE @ 0x00bc {
+            a bit @0 rw = 0
+            b bit @1 rw = 0
+        }
+        COMMAND_MXU_CTRL @ 0x00c0 {
+            valid bit @0 rw = 0
+            accum_en bit @1 rw = 0
+            acc_clear bit @2 rw = 0
+            spill_en bit @3 rw = 0
+            restore_en bit @4 rw = 0
+        }
+        COMMAND_MXU_A_BASE @ 0x00c4 split<32> value u64 rw = 0 order low_first
+        COMMAND_MXU_B_BASE @ 0x00cc split<32> value u64 rw = 0 order low_first
+        COMMAND_MXU_C_BASE @ 0x00d4 split<32> value u64 rw = 0 order low_first
+        COMMAND_MXU_ACC_BASE @ 0x00dc split<32> value u64 rw = 0 order low_first
+        COMMAND_MXU_MODE @ 0x00f4 { value bits<3> @2:0 rw = 0 }
+        COMMAND_MXU_XPOSE @ 0x00f8 {
+            a bit @0 rw = 0
+            b bit @1 rw = 0
+        }
+        COMMAND_MXU_A_STRIDE @ 0x00fc { value bits<32> @31:0 rw = 0 }
+        COMMAND_MXU_B_STRIDE @ 0x0100 { value bits<32> @31:0 rw = 0 }
+        COMMAND_MXU_ZERO_SKIP @ 0x0104 {
+            a bit @0 rw = 0
+            b bit @1 rw = 0
+        }
+        COMMAND_MXU_K_DIM @ 0x0108 { value bits<32> @31:0 rw = 0 }
+
+        DEBUG_COMMAND_OUTPUT_ADDRESS @ 0x010c {
+            value u32 @31:0 ro <- status.debug.command_output.address_low
+        }
+        DEBUG_COMMAND_OUTPUT_AUXILIARY @ 0x0110 {
+            value u32 @31:0 ro <- status.debug.command_output.auxiliary_low
+        }
+        DEBUG_COMMAND_OUTPUT_META @ 0x0114 {
+            length u16 @15:0 ro <- status.debug.command_output.length
+            opcode u4 @19:16 ro <- status.debug.command_output.opcode
+        }
+        DEBUG_UB_LAUNCH_FLAGS @ 0x0118 {
+            pending bit @0 ro <- status.debug.ub_dma.launch_pending
+            capture_armed bit @1 ro <- status.debug.ub_dma.capture_armed
+            capture_ok bit @2 ro <- status.debug.ub_dma.capture_ok
+            capture bit @3 ro <- status.debug.ub_dma.capture
+            start bit @4 ro <- status.debug.ub_dma.start
+        }
+        DEBUG_UB_LAUNCH_DRAM @ 0x011c {
+            value u32 @31:0 ro <- status.debug.ub_dma.launch_dram_low
+        }
+        DEBUG_UB_LAUNCH_UB @ 0x0120 {
+            value u32 @31:0 ro <- status.debug.ub_dma.launch_ub_low
+        }
+        DEBUG_UB_LAUNCH_LENGTH @ 0x0124 {
+            value u32 @31:0 ro <- status.debug.ub_dma.launch_length
+        }
+        DEBUG_UB_START_FLAGS @ 0x0128 {
+            seen bit @0 ro <- status.debug.ub_dma.start_seen
+            store bit @1 ro <- status.debug.ub_dma.start_store
+        }
+        DEBUG_UB_START_DRAM @ 0x012c {
+            value u32 @31:0 ro <- status.debug.ub_dma.start_dram_low
+        }
+        DEBUG_UB_START_UB @ 0x0130 {
+            value u32 @31:0 ro <- status.debug.ub_dma.start_ub_low
+        }
+        DEBUG_UB_START_LENGTH @ 0x0134 {
+            value u32 @31:0 ro <- status.debug.ub_dma.start_length
+        }
+        DEBUG_CONFIG_COMMAND_ADDRESS @ 0x0138 {
+            value u32 @31:0 ro <- status.debug.config_command.address_low
+        }
+        DEBUG_CONFIG_COMMAND_AUXILIARY @ 0x013c {
+            value u32 @31:0 ro <- status.debug.config_command.auxiliary_low
+        }
+        DEBUG_CONFIG_COMMAND_META @ 0x0140 {
+            length u16 @15:0 ro <- status.debug.config_command.length
+            opcode u4 @19:16 ro <- status.debug.config_command.opcode
+            pending bit @20 ro <- status.debug.config_command.valid
+        }
+        DEBUG_COMMAND_INPUT_ADDRESS @ 0x0144 {
+            value u32 @31:0 ro <- status.debug.command_input.address_low
+        }
+        DEBUG_COMMAND_INPUT_AUXILIARY @ 0x0148 {
+            value u32 @31:0 ro <- status.debug.command_input.auxiliary_low
+        }
+        DEBUG_COMMAND_INPUT_META @ 0x014c {
+            length u16 @15:0 ro <- status.debug.command_input.length
+            opcode u4 @19:16 ro <- status.debug.command_input.opcode
+            valid bit @20 ro <- status.debug.command_input.valid
+        }
+        DEBUG_QUEUE_PUSH_ADDRESS @ 0x0150 {
+            value u32 @31:0 ro <- status.debug.queue.push.address_low
+        }
+        DEBUG_QUEUE_PUSH_AUXILIARY @ 0x0154 {
+            value u32 @31:0 ro <- status.debug.queue.push.auxiliary_low
+        }
+        DEBUG_QUEUE_PUSH_META @ 0x0158 {
+            length u16 @15:0 ro <- status.debug.queue.push.length
+            opcode u4 @19:16 ro <- status.debug.queue.push.opcode
+            seen bit @20 ro <- status.debug.queue.push.valid
+        }
+        DEBUG_QUEUE_HEAD_ADDRESS @ 0x015c {
+            value u32 @31:0 ro <- status.debug.queue.head.address_low
+        }
+        DEBUG_QUEUE_HEAD_AUXILIARY @ 0x0160 {
+            value u32 @31:0 ro <- status.debug.queue.head.auxiliary_low
+        }
+        DEBUG_QUEUE_HEAD_META @ 0x0164 {
+            length u16 @15:0 ro <- status.debug.queue.head.length
+            opcode u4 @19:16 ro <- status.debug.queue.head.opcode
+            seen bit @20 ro <- status.debug.queue.head.valid
+        }
+        DEBUG_QUEUE_POINTERS @ 0x0168 {
+            head u16 @15:0 ro <- status.debug.queue.head_pointer
+            tail u16 @31:16 ro <- status.debug.queue.tail_pointer
+        }
+        DEBUG_QUEUE_STATE @ 0x016c {
+            count u16 @15:0 ro <- status.debug.queue.count
+            head_valid bit @16 ro <- status.debug.queue.current_head_valid
+            empty bit @17 ro <- status.debug.queue.empty
+        }
+
+        DMA_FAULT_STATUS @ 0x0170 {
+            valid bit @0 ro <- status.fault.valid
+            overflow bit @1 ro <- status.fault.overflow
+            write bit @2 ro <- status.fault.write
+            master u4 @7:4 ro <- status.fault.master
+            clear bits<2> @1:0 on_write -> fault_clear
+        }
+        DMA_FAULT_ADDR_LO @ 0x0174 {
+            value u32 @31:0 ro <- status.fault.addr_low
+        }
+        DMA_FAULT_ADDR_HI @ 0x0178 {
+            value u32 @31:0 ro <- status.fault.addr_high
+        }
+        DMA_FAULT_INFO @ 0x017c {
+            len u8 @7:0 ro <- status.fault.len
+            size u3 @10:8 ro <- status.fault.size
+        }
+        COMMAND_DMA_CTRL @ 0x0180 {
+            start bit @0 pulse
+            clear bit @1 pulse
+        }
+        COMMAND_DMA_BASE @ 0x0184 split<32> value u64 rw = 0 order low_first
+        COMMAND_DMA_COUNT @ 0x018c { value uint<24> @23:0 rw = 0 }
+        COMMAND_DMA_STATUS @ 0x0190 {
+            busy bit @0 ro <- status.command_dma.busy
+            done bit @1 ro <- status.command_dma.done
+            error bit @2 ro <- status.command_dma.error
+            error_code u4 @6:3 ro <- status.command_dma.error_code
+        }
+        COMMAND_DMA_FETCHED @ 0x0194 {
+            value uint<24> @23:0 ro <- status.command_dma.fetched_count
+        }
+    }
+}
+
+// Canonical access core. Bus frontends own transport timing; this module is the
+// sole owner of CSR state, command snapshots, and status/control projection.
+module ZtpuQueuedCfgAccessCore64x32 {
+    clock clk reset rst
+
+    in access_valid, access_write : bit
+    in access_addr, access_wdata : u32
+    out access_rdata : u32
+    out access_error : bit
+
+    in status : ZtpuCfgStatus
+    out control : ZtpuCfgControl
+
+    inst bank : ZtpuCsrBank64x32 {
+        status
+        addr = access_addr
+        write = access_valid & access_write
+        wdata = access_wdata
+        // Continuous decode preserves compatibility HRDATA while registered
+        // frontends snapshot the selected value with their accepted request.
+        read = 1
+    }
+
+    live_command : ZtpuCommand = empty_command() with {
+        opcode = bank.registers.COMMAND_OPCODE.value
+        address = bitcast<bits<64>>(bank.registers.COMMAND_ADDRESS.value)
+        auxiliary = bitcast<bits<64>>(bank.registers.COMMAND_AUXILIARY.value)
+        length = bank.registers.COMMAND_LENGTH.value[15:0]
+        tag = bank.registers.COMMAND_TAG.value
+        dependency_tag = bank.registers.COMMAND_DEPENDENCY_TAG.value
+        source1_base = bitcast<bits<64>>(bank.extended.COMMAND_SRC1_BASE.value)
+        scalar0 = bank.extended.COMMAND_SCALAR0.value
+        scalar1 = bank.extended.COMMAND_SCALAR1.value
+        scalar2 = bank.extended.COMMAND_SCALAR2.value
+        scalar3 = bank.extended.COMMAND_SCALAR3.value
+        mxu_valid = bank.extended.COMMAND_MXU_CTRL.valid
+        mxu_a_base = bitcast<bits<64>>(bank.extended.COMMAND_MXU_A_BASE.value)
+        mxu_b_base = bitcast<bits<64>>(bank.extended.COMMAND_MXU_B_BASE.value)
+        mxu_c_base = bitcast<bits<64>>(bank.extended.COMMAND_MXU_C_BASE.value)
+        mxu_acc_base = bitcast<bits<64>>(bank.extended.COMMAND_MXU_ACC_BASE.value)
+        mxu_a_stride = bank.extended.COMMAND_MXU_A_STRIDE.value
+        mxu_b_stride = bank.extended.COMMAND_MXU_B_STRIDE.value
+        mxu_k_dim = bank.extended.COMMAND_MXU_K_DIM.value
+        mxu_accum_en = bank.extended.COMMAND_MXU_CTRL.accum_en
+        mxu_acc_clear = bank.extended.COMMAND_MXU_CTRL.acc_clear
+        mxu_spill_en = bank.extended.COMMAND_MXU_CTRL.spill_en
+        mxu_restore_en = bank.extended.COMMAND_MXU_CTRL.restore_en
+        mxu_mode = bank.extended.COMMAND_MXU_MODE.value
+        mxu_a_transpose = bank.extended.COMMAND_MXU_XPOSE.a
+        mxu_b_transpose = bank.extended.COMMAND_MXU_XPOSE.b
+        mxu_zs_enable_a = bank.extended.COMMAND_MXU_ZERO_SKIP.a
+        mxu_zs_enable_b = bank.extended.COMMAND_MXU_ZERO_SKIP.b
+        adam_valid = bank.registers.COMMAND_OPCODE.value == 6
+        adam_clear = bank.extended.DIRECT_ADAM_CTRL.clear_config
+        adam_m_base = bitcast<bits<64>>(bank.extended.COMMAND_ADAM_M_BASE.value)
+        adam_v_base = bitcast<bits<64>>(bank.extended.COMMAND_ADAM_V_BASE.value)
+        adam_lr = bank.extended.COMMAND_ADAM_LR.value
+        adam_beta1 = bank.extended.COMMAND_ADAM_BETA1.value
+        adam_beta2 = bank.extended.COMMAND_ADAM_BETA2.value
+        adam_eps = bank.extended.COMMAND_ADAM_EPS.value
+    }
+    direct_zero_skip : bits<2> = bank.extended.ZERO_SKIP_CTRL.value
+
+    inst queued_command_snapshot : StorageSnapshot<
+        T=ZtpuCommand,
+        reset_value=fn empty_command
+    > {
+        input = live_command
+        capture = bank.registers.COMMAND_PUSH.push
+    }
+
+    reg queued_valid_state : bit = 0
+    queued_valid_state <- mux(
+        bank.registers.COMMAND_PUSH.push,
+        1,
+        mux(status.command.accept, 0, queued_valid_state)
+    )
+
+    access_rdata = bank.rdata
+    access_error = access_valid & (~bank.ready)
+
+    control = ZtpuCfgControl {
+        direct = ZtpuCfgDirectControl {
+            dma = ZtpuCfgUbDmaControl {
+                enable = bank.registers.UB_DMA_CTRL.enable
+                start = bank.registers.UB_DMA_CTRL.start
+                store = bank.registers.UB_DMA_CTRL.store
+                dram_base = bank.registers.UB_DMA_DRAM_BASE.value
+                ub_base = bank.registers.UB_DMA_UB_BASE.value
+                length = bank.registers.UB_DMA_LENGTH.value
+            }
+            mxu = ZtpuCfgMxuControl {
+                enable = bank.registers.UB_MXU_CTRL.enable
+                start = bank.registers.UB_MXU_CTRL.start
+                accumulate = bank.registers.UB_MXU_CTRL.accumulate
+                clear_accumulator = bank.registers.UB_MXU_CTRL.clear_accumulator
+                spill = bank.registers.UB_MXU_CTRL.spill
+                restore = bank.registers.UB_MXU_CTRL.restore
+                a_base = bank.registers.UB_MXU_A_BASE.value
+                b_base = bank.registers.UB_MXU_B_BASE.value
+                c_base = bank.registers.UB_MXU_C_BASE.value
+                accumulator_base = bank.registers.UB_MXU_ACC_BASE.value
+                a_stride = bank.registers.UB_MXU_A_STRIDE.value
+                b_stride = bank.registers.UB_MXU_B_STRIDE.value
+                k_dim = bank.registers.UB_MXU_K_DIM.value
+                requant_enable = bank.registers.UB_MXU_REQUANT_CTRL.enable
+                requant_scale = bank.registers.UB_MXU_REQUANT_SCALE.value
+                requant_shift = bank.registers.UB_MXU_REQUANT_SHIFT.value
+                requant_zero = bank.registers.UB_MXU_REQUANT_ZERO.value
+                mode = bank.registers.UB_MXU_MODE.value
+                transpose_a = bank.extended.UB_MXU_TRANSPOSE.a
+                transpose_b = bank.extended.UB_MXU_TRANSPOSE.b
+                zero_skip_a = direct_zero_skip[0]
+                zero_skip_b = direct_zero_skip[1]
+            }
+            adam = ZtpuCfgAdamControl {
+                enable = bank.extended.DIRECT_ADAM_CTRL.enable
+                start = bank.extended.DIRECT_ADAM_CTRL.start
+                clear = bank.adam_clear
+                weight_base = bank.extended.DIRECT_ADAM_W_BASE.value
+                gradient_base = bank.extended.DIRECT_ADAM_G_BASE.value
+                moment_base = bank.extended.COMMAND_ADAM_M_BASE.value
+                variance_base = bank.extended.COMMAND_ADAM_V_BASE.value
+                length = bank.extended.DIRECT_ADAM_LENGTH.value
+                learning_rate = bank.extended.COMMAND_ADAM_LR.value
+                beta1 = bank.extended.COMMAND_ADAM_BETA1.value
+                beta2 = bank.extended.COMMAND_ADAM_BETA2.value
+                epsilon = bank.extended.COMMAND_ADAM_EPS.value
+            }
+            vmu = ZtpuCfgVmuControl {
+                enable = bank.extended.UB_VMU_CTRL.enable
+                start = bank.extended.UB_VMU_CTRL.start
+                operation = bank.extended.UB_VMU_OPERATION.value
+                source0_base = bank.extended.UB_VMU_SOURCE0_BASE.value
+                source1_base = bank.extended.UB_VMU_SOURCE1_BASE.value
+                destination_base = bank.extended.UB_VMU_DESTINATION_BASE.value
+                length = bank.extended.UB_VMU_LENGTH.value
+                scalar0 = bank.extended.UB_VMU_SCALAR0.value
+                scalar1 = bank.extended.UB_VMU_SCALAR1.value
+                scalar2 = bank.extended.UB_VMU_SCALAR2.value
+                scalar3 = bank.extended.UB_VMU_SCALAR3.value
+            }
+        }
+        command_push = bank.registers.COMMAND_PUSH.push
+        live_command = live_command
+        live_length = bank.registers.COMMAND_LENGTH.value
+        queued_valid = queued_valid_state
+        queued_command = queued_command_snapshot.output
+        command_dma = ZtpuCfgCommandDmaControl {
+            start = bank.extended.COMMAND_DMA_CTRL.start
+            clear = bank.extended.COMMAND_DMA_CTRL.clear
+            base = bank.extended.COMMAND_DMA_BASE.value
+            count = bank.extended.COMMAND_DMA_COUNT.value
+        }
+        completion = ZtpuCfgCompletionControl {
+            enable = bank.registers.COMPLETION_CTRL.enable
+            clear = bank.registers.COMPLETION_CTRL.clear
+            pop = bank.registers.COMPLETION_POP.pop
+            irq_enable = bank.registers.COMPLETION_CTRL.irq_enable
+        }
+        fence = ZtpuCfgFenceControl {
+            global_window = ZtpuCfgFenceWindow {
+                enable = bank.registers.global_fence[0].CTRL.enable
+                base = bank.registers.global_fence[0].BASE.value
+                limit = bank.registers.global_fence[0].LIMIT.value
+            }
+            ub_window = ZtpuCfgFenceWindow {
+                enable = bank.registers.domain_fences[1].CTRL.enable
+                base = bank.registers.domain_fences[1].BASE.value
+                limit = bank.registers.domain_fences[1].LIMIT.value
+            }
+            ub_read_window = ZtpuCfgFenceWindow {
+                enable = bank.registers.master_fences[2].CTRL.enable
+                base = bank.registers.master_fences[2].BASE.value
+                limit = bank.registers.master_fences[2].LIMIT.value
+            }
+            ub_write_window = ZtpuCfgFenceWindow {
+                enable = bank.registers.master_fences[3].CTRL.enable
+                base = bank.registers.master_fences[3].BASE.value
+                limit = bank.registers.master_fences[3].LIMIT.value
+            }
+            clear_valid = bank.fault_clear[0]
+            clear_overflow = bank.fault_clear[1]
+        }
+        perf = ZtpuCfgPerfControl {
+            enable = bank.registers.PERF_CTRL.enable
+            clear = bank.registers.PERF_CTRL.clear
+            clear_error = bank.registers.PERF_CTRL.clear_error
+        }
+        layout = ZtpuCfgLayoutControl {
+            start = bank.registers.LAYOUT_CTRL.start
+            dma_enable = bank.registers.LAYOUT_CTRL.dma_enable
+            source_tiler = bank.registers.LAYOUT_CTRL.source_tiler
+            layout_in = bank.registers.LAYOUT_CFG.layout_in
+            layout_out = bank.registers.LAYOUT_CFG.layout_out
+            base_in = bank.registers.LAYOUT_BASE_IN.value
+            base_out = bank.registers.LAYOUT_BASE_OUT.value
+            in_stride_n = bank.registers.LAYOUT_IN_STRIDE_N.value
+            in_stride_c = bank.registers.LAYOUT_IN_STRIDE_C.value
+            in_stride_h = bank.registers.LAYOUT_IN_STRIDE_H.value
+            in_stride_w = bank.registers.LAYOUT_IN_STRIDE_W.value
+            in_stride_cb = bank.registers.LAYOUT_IN_STRIDE_CB.value
+            out_stride_n = bank.registers.LAYOUT_OUT_STRIDE_N.value
+            out_stride_c = bank.registers.LAYOUT_OUT_STRIDE_C.value
+            out_stride_h = bank.registers.LAYOUT_OUT_STRIDE_H.value
+            out_stride_w = bank.registers.LAYOUT_OUT_STRIDE_W.value
+            out_stride_cb = bank.registers.LAYOUT_OUT_STRIDE_CB.value
+            n_dim = bank.registers.LAYOUT_N_DIM.value
+            c_dim = bank.registers.LAYOUT_C_DIM.value
+            h_dim = bank.registers.LAYOUT_H_DIM.value
+            w_dim = bank.registers.LAYOUT_W_DIM.value
+            tiler_start = bank.registers.TILER_CTRL.start
+            tiler_ready = bank.registers.TILER_CTRL.ready
+            tiler_base = bank.registers.TILER_BASE.value
+            tiler_row_stride = bank.registers.TILER_ROW_STRIDE.value
+            tiler_col_stride = bank.registers.TILER_COL_STRIDE.value
+            tiler_rows = bank.registers.TILER_ROWS.value
+            tiler_cols = bank.registers.TILER_COLS.value
+            layout_fence = ZtpuCfgFenceWindow {
+                enable = bank.registers.domain_fences[0].CTRL.enable
+                base = bank.registers.domain_fences[0].BASE.value
+                limit = bank.registers.domain_fences[0].LIMIT.value
+            }
+            read_fence = ZtpuCfgFenceWindow {
+                enable = bank.registers.master_fences[0].CTRL.enable
+                base = bank.registers.master_fences[0].BASE.value
+                limit = bank.registers.master_fences[0].LIMIT.value
+            }
+            write_fence = ZtpuCfgFenceWindow {
+                enable = bank.registers.master_fences[1].CTRL.enable
+                base = bank.registers.master_fences[1].BASE.value
+                limit = bank.registers.master_fences[1].LIMIT.value
+            }
+        }
+    }
+}
+
+// One-request-at-a-time registered transport. A request updates write/pulse
+// state on acceptance and produces exactly one held response on the next cycle.
+module ZtpuQueuedCfgRegBus64x32 {
+    clock clk reset rst
+    interface regbus : RegBus<32,32>.responder @clk
+    in status : ZtpuCfgStatus
+    out control : ZtpuCfgControl
+
+    reg response_pending : bit = 0
+    reg response : RegResponse<32> = RegResponse { rdata = 0 error = 0 }
+
+    accept : bit = regbus.request.transfer
+    response_pending <- mux(
+        accept, 1, mux(regbus.response.transfer, 0, response_pending)
+    )
+    when accept {
+        response <- RegResponse { rdata = access.access_rdata error = access.access_error }
+    }
+
+    inst access : ZtpuQueuedCfgAccessCore64x32 {
+        status
+        access_valid = accept
+        access_write = regbus.request.payload.write
+        access_addr = regbus.request.payload.addr
+        access_wdata = regbus.request.payload.wdata
+    }
+
+    regbus.request.ready = ~response_pending
+    regbus.response.valid = response_pending
+    regbus.response.payload = response
+    control = access.control
+}
+
+// Native AHB-Lite frontend. ZLang specializes the standard bridge to this
+// module's synchronous active-high clock/reset contract.
+module ZtpuQueuedCfgAhb64x32 {
+    clock clk reset rst
+    interface ahb : AHBLite<32,32>.slave @clk
+    in status : ZtpuCfgStatus
+    out control : ZtpuCfgControl
+
+    inst frontend : AHBLiteToRegBus<32,32>
+    inst target : ZtpuQueuedCfgRegBus64x32 { status }
+
+    ahb -> frontend.ahb
+    frontend.regbus -> target.regbus
+    control = target.control
+}
+
+// Native registered APB frontend. Both standard bridges share exactly one CSR
+// access implementation and register map.
+module ZtpuQueuedCfgApb64x32 {
+    clock clk reset rst
+    interface apb : APB<32,32>.slave @clk
+    in status : ZtpuCfgStatus
+    out control : ZtpuCfgControl
+
+    inst frontend : APBToRegBus<32,32>
+    inst target : ZtpuQueuedCfgRegBus64x32 { status }
+
+    apb -> frontend.apb
+    frontend.regbus -> target.regbus
+    control = target.control
+}

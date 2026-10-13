@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+module ZtpuPeQ16 {
+    clock clk
+    reset rst
+
+    in input_v : s16
+    in input_w : s16
+    in input_acc : s32
+
+    out reg output_acc : s32 = 0
+    out reg output_v : s16 = 0
+    out reg output_w : s16 = 0
+
+    product : s32 = input_v * input_w
+    next_acc : s32 = truncate<32>(input_acc + product)
+
+    output_acc <- next_acc
+    output_v <- input_v
+    output_w <- input_w
+}
+
+// Packed-int8 lanes are sign-extended to 32 bits before entering the MXU.
+// The PE therefore retains the source design's 32-bit multiply truncation and
+// wrapping accumulator behavior at every cycle.
+module ZtpuPeI32 {
+    clock clk
+    reset rst
+
+    in input_v : s32
+    in input_w : s32
+    in input_acc : s32
+
+    out reg output_acc : s32 = 0
+    out reg output_v : s32 = 0
+    out reg output_w : s32 = 0
+
+    product_wide : s64 = input_v * input_w
+    product : s32 = truncate<32>(product_wide)
+    next_acc : s32 = truncate<32>(input_acc + product)
+
+    output_acc <- next_acc
+    output_v <- input_v
+    output_w <- input_w
+}

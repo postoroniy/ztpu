@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.fixed_luts
+
+fn ztpu_fxp_mul_q16_wrap(a : s32, b : s32) -> s32 {
+    truncate<32>(truncate<64>((a * b) + 32768) >> 16)
+}
+
+fn ztpu_msb_index_u32(value : bits<32>) -> u6 {
+    reduce(|, generate(i in 0..32) mux(
+        value[i] &
+            ~reduce(|, generate(j in 0..32)
+                (value[j] &
+                    (extend<6>(j) > extend<6>(i)))),
+        extend<6>(i),
+        0
+    ))
+}
+
+enum ZtpuReciprocalPhase { Idle SeedRequest SeedWait Iterate Scale Done }
+enum ZtpuRsqrtPhase { Idle SeedRequest SeedWait Iterate Scale Done }
+
+module ZtpuReciprocalNr2Q16 {
+    clock clk reset rst
+
+    in start : bit
+    in x : u32
+    out busy, done : bit
+    out y : u32
+
+    inst seed_lut : ZtpuReciprocalSeedLutQ16
+
+    reg iteration : u2 = 0
+    reg result : s32 = 0
+
+    idle : bit = phase == ZtpuReciprocalPhase.Idle
+    seed_request_state : bit = phase == ZtpuReciprocalPhase.SeedRequest
+    seed_wait_state : bit = phase == ZtpuReciprocalPhase.SeedWait
+    iterate_state : bit = phase == ZtpuReciprocalPhase.Iterate
+    scale_state : bit = phase == ZtpuReciprocalPhase.Scale
+    done_state : bit = phase == ZtpuReciprocalPhase.Done
+
+    positive_x : u32 = mux(x == 0, 1, x)
+    msb : u6 = ztpu_msb_index_u32(bitcast<bits<32>>(positive_x))
+    exponent : s7 = truncate<7>(extend<7>(bitcast<s6>(msb)) - 15)
+    exponent_negative : bit = bitcast<bits<7>>(exponent)[6]
+    exponent_abs : u6 = mux(
+        exponent_negative,
+        bitcast<u6>(truncate<6>(0 - exponent)),
+        bitcast<u6>(truncate<6>(exponent))
+    )
+    shifted_x : u32 = mux(
+        exponent_negative,
+        truncate<32>(positive_x << exponent_abs),
+        positive_x >> exponent_abs
+    )
+    normalized_x : u32 = mux(
+        shifted_x < 32768,
+        32768,
+        mux(shifted_x >= 65536, 65535, shifted_x)
+    )
+    lut_index : u8 = truncate<8>((normalized_x - 32768) >> 7)
+
+    xy : s32 = ztpu_fxp_mul_q16_wrap(bitcast<s32>(normalized_x), result)
+    term : s32 = truncate<32>(131072 - xy)
+    iteration_result : s32 = ztpu_fxp_mul_q16_wrap(result, term)
+    scaled_result : s32 = mux(
+        exponent_negative,
+        truncate<32>(result << exponent_abs),
+        result >> exponent_abs
+    )
+
+    seed_lut.request = seed_request_state
+    seed_lut.address = lut_index
+
+    iteration <- mux(
+        idle,
+        0,
+        mux(
+            seed_wait_state & seed_lut.data_valid,
+            0,
+            mux(iterate_state & (iteration != 1), truncate<2>(iteration + 1), iteration)
+        )
+    )
+    result <- mux(
+        idle,
+        0,
+        mux(
+            seed_wait_state & seed_lut.data_valid,
+            bitcast<s32>(seed_lut.data),
+            mux(iterate_state, iteration_result, mux(scale_state, scaled_result, result))
+        )
+    )
+
+    busy = (~idle) & (~done_state)
+    done = done_state
+    y = bitcast<u32>(result)
+
+    fsm phase : ZtpuReciprocalPhase = Idle {
+        Idle { when start -> SeedRequest {} }
+        SeedRequest { -> SeedWait {} }
+        SeedWait { when seed_lut.data_valid -> Iterate {} }
+        Iterate { when iteration == 1 -> Scale {} }
+        Scale { -> Done {} }
+        Done { -> Idle {} }
+    }
+}
+
+module ZtpuRsqrtNr2Q16 {
+    clock clk reset rst
+
+    in start : bit
+    in x : u32
+    out busy, done : bit
+    out y : u32
+
+    inst seed_lut : ZtpuRsqrtSeedLutQ16
+
+    reg iteration : u2 = 0
+    reg result : s32 = 0
+
+    idle : bit = phase == ZtpuRsqrtPhase.Idle
+    seed_request_state : bit = phase == ZtpuRsqrtPhase.SeedRequest
+    seed_wait_state : bit = phase == ZtpuRsqrtPhase.SeedWait
+    iterate_state : bit = phase == ZtpuRsqrtPhase.Iterate
+    scale_state : bit = phase == ZtpuRsqrtPhase.Scale
+    done_state : bit = phase == ZtpuRsqrtPhase.Done
+
+    positive_x : u32 = mux(x == 0, 1, x)
+    msb : u6 = ztpu_msb_index_u32(bitcast<bits<32>>(positive_x))
+    exponent : s7 = truncate<7>(extend<7>(bitcast<s6>(msb)) - 15)
+    exponent_negative : bit = bitcast<bits<7>>(exponent)[6]
+    exponent_abs : u6 = mux(
+        exponent_negative,
+        bitcast<u6>(truncate<6>(0 - exponent)),
+        bitcast<u6>(truncate<6>(exponent))
+    )
+    shifted_x : u32 = mux(
+        exponent_negative,
+        truncate<32>(positive_x << exponent_abs),
+        positive_x >> exponent_abs
+    )
+    normalized_x : u32 = mux(
+        shifted_x < 32768,
+        32768,
+        mux(shifted_x >= 65536, 65535, shifted_x)
+    )
+    lut_index : u8 = truncate<8>((normalized_x - 32768) >> 7)
+
+    result_squared : s32 = ztpu_fxp_mul_q16_wrap(result, result)
+    x_result_squared : s32 = ztpu_fxp_mul_q16_wrap(
+        bitcast<s32>(normalized_x), result_squared
+    )
+    half_x_result_squared : s32 = ztpu_fxp_mul_q16_wrap(32768, x_result_squared)
+    term : s32 = truncate<32>(98304 - half_x_result_squared)
+    iteration_result : s32 = ztpu_fxp_mul_q16_wrap(result, term)
+    exponent_odd : bit = bitcast<bits<6>>(exponent_abs)[0]
+    exponent_half : u6 = truncate<6>(exponent_abs >> 1)
+    positive_scaled_base : s32 = mux(
+        exponent_odd,
+        ztpu_fxp_mul_q16_wrap(result, 46341),
+        result
+    )
+    negative_scaled_base : s32 = mux(
+        exponent_odd,
+        ztpu_fxp_mul_q16_wrap(result, 92682),
+        result
+    )
+    scaled_result : s32 = mux(
+        exponent_negative,
+        truncate<32>(negative_scaled_base << exponent_half),
+        positive_scaled_base >> exponent_half
+    )
+
+    seed_lut.request = seed_request_state
+    seed_lut.address = lut_index
+
+    iteration <- mux(
+        idle,
+        0,
+        mux(
+            seed_wait_state & seed_lut.data_valid,
+            0,
+            mux(iterate_state & (iteration != 1), truncate<2>(iteration + 1), iteration)
+        )
+    )
+    result <- mux(
+        idle,
+        0,
+        mux(
+            seed_wait_state & seed_lut.data_valid,
+            bitcast<s32>(seed_lut.data),
+            mux(iterate_state, iteration_result, mux(scale_state, scaled_result, result))
+        )
+    )
+
+    busy = (~idle) & (~done_state)
+    done = done_state
+    y = bitcast<u32>(result)
+
+    fsm phase : ZtpuRsqrtPhase = Idle {
+        Idle { when start -> SeedRequest {} }
+        SeedRequest { -> SeedWait {} }
+        SeedWait { when seed_lut.data_valid -> Iterate {} }
+        Iterate { when iteration == 1 -> Scale {} }
+        Scale { -> Done {} }
+        Done { -> Idle {} }
+    }
+}

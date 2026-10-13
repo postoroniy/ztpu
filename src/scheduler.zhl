@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+struct ZtpuCommand {
+    opcode : bits<4>
+    address : bits<64>
+    auxiliary : bits<64>
+    length : bits<16>
+    tag : u8
+    dependency_tag : u8
+    dependency_instance : u16
+    source1_base : bits<64>
+    scalar0 : bits<32>
+    scalar1 : bits<32>
+    scalar2 : bits<32>
+    scalar3 : bits<32>
+    mxu_valid : bit
+    mxu_a_base : bits<64>
+    mxu_b_base : bits<64>
+    mxu_c_base : bits<64>
+    mxu_acc_base : bits<64>
+    mxu_a_stride : bits<32>
+    mxu_b_stride : bits<32>
+    mxu_k_dim : bits<32>
+    mxu_accum_en : bit
+    mxu_acc_clear : bit
+    mxu_spill_en : bit
+    mxu_restore_en : bit
+    mxu_rq_enable : bit
+    mxu_rq_scale : bits<32>
+    mxu_rq_shift : bits<8>
+    mxu_rq_zero : bits<32>
+    mxu_mode : bits<3>
+    mxu_a_transpose : bit
+    mxu_b_transpose : bit
+    mxu_zs_enable_a : bit
+    mxu_zs_enable_b : bit
+    adam_valid : bit
+    adam_clear : bit
+    adam_m_base : bits<64>
+    adam_v_base : bits<64>
+    adam_lr : bits<32>
+    adam_beta1 : bits<32>
+    adam_beta2 : bits<32>
+    adam_eps : bits<32>
+}
+
+fn empty_command() -> ZtpuCommand {
+    ZtpuCommand {
+        opcode = 0 address = 0 auxiliary = 0 length = 0
+        tag = 0 dependency_tag = 0 dependency_instance = 0
+        source1_base = 0 scalar0 = 0 scalar1 = 0 scalar2 = 0 scalar3 = 0
+        mxu_valid = 0 mxu_a_base = 0 mxu_b_base = 0 mxu_c_base = 0
+        mxu_acc_base = 0 mxu_a_stride = 0 mxu_b_stride = 0 mxu_k_dim = 0
+        mxu_accum_en = 0 mxu_acc_clear = 0 mxu_spill_en = 0 mxu_restore_en = 0
+        mxu_rq_enable = 0 mxu_rq_scale = 0 mxu_rq_shift = 0 mxu_rq_zero = 0
+        mxu_mode = 0 mxu_a_transpose = 0 mxu_b_transpose = 0
+        mxu_zs_enable_a = 0 mxu_zs_enable_b = 0
+        adam_valid = 0 adam_clear = 0 adam_m_base = 0 adam_v_base = 0
+        adam_lr = 0 adam_beta1 = 0 adam_beta2 = 0 adam_eps = 0
+    }
+}
+
+module ZtpuCommandQueue4 {
+    clock clk
+    reset rst
+
+    in in_valid : bit
+    out in_ready : bit
+    in in_opcode : bits<4>
+    in in_addr : bits<64>
+    in in_aux : bits<64>
+    in in_length : bits<16>
+    in in_tag : u8
+    in in_dep_tag : u8
+    in in_src1_base : bits<64>
+    in in_scalar0, in_scalar1, in_scalar2, in_scalar3 : bits<32>
+    in in_mxu_valid : bit
+    in in_mxu_a_base, in_mxu_b_base, in_mxu_c_base, in_mxu_acc_base : bits<64>
+    in in_mxu_a_stride, in_mxu_b_stride, in_mxu_k_dim : bits<32>
+    in in_mxu_accum_en, in_mxu_acc_clear, in_mxu_spill_en, in_mxu_restore_en : bit
+    in in_mxu_rq_enable : bit
+    in in_mxu_rq_scale : bits<32>
+    in in_mxu_rq_shift : bits<8>
+    in in_mxu_rq_zero : bits<32>
+    in in_mxu_mode : bits<3>
+    in in_mxu_a_transpose, in_mxu_b_transpose : bit
+    in in_mxu_zs_enable_a, in_mxu_zs_enable_b : bit
+    in in_adam_valid, in_adam_clear : bit
+    in in_adam_m_base, in_adam_v_base : bits<64>
+    in in_adam_lr, in_adam_beta1, in_adam_beta2, in_adam_eps : bits<32>
+
+    out reg out_valid : bit = 0
+    in out_ready : bit
+    out out_opcode : bits<4>
+    out out_addr : bits<64>
+    out out_aux : bits<64>
+    out out_length : bits<16>
+    out out_tag : u8
+    out out_dep_tag : u8
+    out out_src1_base : bits<64>
+    out out_scalar0, out_scalar1, out_scalar2, out_scalar3 : bits<32>
+    out out_mxu_valid : bit
+    out out_mxu_a_base, out_mxu_b_base, out_mxu_c_base, out_mxu_acc_base : bits<64>
+    out out_mxu_a_stride, out_mxu_b_stride, out_mxu_k_dim : bits<32>
+    out out_mxu_accum_en, out_mxu_acc_clear, out_mxu_spill_en, out_mxu_restore_en : bit
+    out out_mxu_rq_enable : bit
+    out out_mxu_rq_scale : bits<32>
+    out out_mxu_rq_shift : bits<8>
+    out out_mxu_rq_zero : bits<32>
+    out out_mxu_mode : bits<3>
+    out out_mxu_a_transpose, out_mxu_b_transpose : bit
+    out out_mxu_zs_enable_a, out_mxu_zs_enable_b : bit
+    out out_adam_valid, out_adam_clear : bit
+    out out_adam_m_base, out_adam_v_base : bits<64>
+    out out_adam_lr, out_adam_beta1, out_adam_beta2, out_adam_eps : bits<32>
+
+    in done_valid : bit
+    in done_tag : u8
+    out reg count : u3 = 0
+    out reg last_done : u8 = 0
+    out reg debug_push_seen : bit = 0
+    out reg debug_head_seen : bit = 0
+    out reg debug_push_address : bits<64> = 0
+    out reg debug_push_auxiliary : bits<64> = 0
+    out reg debug_head_address : bits<64> = 0
+    out reg debug_head_auxiliary : bits<64> = 0
+    out reg debug_push_length : bits<16> = 0
+    out reg debug_head_length : bits<16> = 0
+    out reg debug_push_opcode : bits<4> = 0
+    out reg debug_head_opcode : bits<4> = 0
+    out debug_empty, debug_head_valid : bit
+    out debug_head_pointer, debug_tail_pointer, debug_count : u16
+
+    reg entries : vec<4,ZtpuCommand> = generate(i in 0..4) empty_command()
+    reg tag_push_count : vec<256,u16> = generate(i in 0..256) 0
+    reg tag_done_count : vec<256,u16> = generate(i in 0..256) 0
+    reg head_index : u2 = 0
+    reg tail_index : u2 = 0
+    reg enqueued_valid : bit = 0
+    reg enqueued : ZtpuCommand = empty_command()
+    reg enqueued_tag_index : u8 = 0
+    reg enqueued_dep_index : u8 = 0
+    reg pending_valid : bit = 0
+    reg pending : ZtpuCommand = empty_command()
+    reg pending_tag_index : u8 = 0
+    reg pending_tag_count : u16 = 0
+    reg head_dep_index : u8 = 0
+    reg head_dep_instance : u16 = 0
+
+    queued_or_pending : u4 = truncate<4>(
+        extend<4>(count) + extend<4>(bitcast<u1>(pending_valid))
+    )
+    enqueue_capacity : bit = queued_or_pending < 4
+    accept : bit = in_valid & (~enqueued_valid) & enqueue_capacity
+    launch : bit = enqueued_valid & (~pending_valid) & enqueue_capacity
+    commit : bit = pending_valid
+    head_command : ZtpuCommand = entries[head_index]
+    next_head_index : u2 = truncate<2>(head_index + 1)
+    next_head_command : ZtpuCommand = entries[next_head_index]
+    dependency_pushes : u16 = tag_push_count[enqueued_dep_index]
+    dependency_dones : u16 = tag_done_count[enqueued_dep_index]
+    dependency_target : u16 = mux(
+        enqueued_dep_index == 0,
+        0,
+        mux(
+            dependency_pushes > dependency_dones,
+            dependency_pushes,
+            mux(dependency_dones == 0, 1, dependency_dones)
+        )
+    )
+    launched_command : ZtpuCommand = enqueued with {
+        dependency_instance = dependency_target
+    }
+    dependency_ok : bit = (count != 0) & (
+        (head_dep_index == 0) |
+        (tag_done_count[head_dep_index] >= head_dep_instance)
+    )
+    pop_entry : bit = out_valid & out_ready
+
+    input_command : ZtpuCommand = ZtpuCommand {
+        opcode = in_opcode address = in_addr auxiliary = in_aux length = in_length
+        tag = in_tag dependency_tag = in_dep_tag dependency_instance = 0
+        source1_base = in_src1_base
+        scalar0 = in_scalar0 scalar1 = in_scalar1 scalar2 = in_scalar2 scalar3 = in_scalar3
+        mxu_valid = in_mxu_valid mxu_a_base = in_mxu_a_base mxu_b_base = in_mxu_b_base
+        mxu_c_base = in_mxu_c_base mxu_acc_base = in_mxu_acc_base
+        mxu_a_stride = in_mxu_a_stride mxu_b_stride = in_mxu_b_stride mxu_k_dim = in_mxu_k_dim
+        mxu_accum_en = in_mxu_accum_en mxu_acc_clear = in_mxu_acc_clear
+        mxu_spill_en = in_mxu_spill_en mxu_restore_en = in_mxu_restore_en
+        mxu_rq_enable = in_mxu_rq_enable mxu_rq_scale = in_mxu_rq_scale
+        mxu_rq_shift = in_mxu_rq_shift mxu_rq_zero = in_mxu_rq_zero
+        mxu_mode = in_mxu_mode mxu_a_transpose = in_mxu_a_transpose
+        mxu_b_transpose = in_mxu_b_transpose mxu_zs_enable_a = in_mxu_zs_enable_a
+        mxu_zs_enable_b = in_mxu_zs_enable_b
+        adam_valid = in_adam_valid adam_clear = in_adam_clear
+        adam_m_base = in_adam_m_base adam_v_base = in_adam_v_base
+        adam_lr = in_adam_lr adam_beta1 = in_adam_beta1
+        adam_beta2 = in_adam_beta2 adam_eps = in_adam_eps
+    }
+
+    when accept {
+        enqueued <- input_command
+        enqueued_tag_index <- in_tag
+        enqueued_dep_index <- in_dep_tag
+    }
+    when launch {
+        pending <- launched_command
+        pending_tag_index <- enqueued_tag_index
+        pending_tag_count <- truncate<16>(tag_push_count[enqueued_tag_index] + 1)
+    }
+    when commit {
+        entries[tail_index] <- pending
+        tag_push_count[pending_tag_index] <- pending_tag_count
+    }
+    when commit & (~debug_push_seen) {
+        debug_push_seen <- 1
+        debug_push_address <- pending.address
+        debug_push_auxiliary <- pending.auxiliary
+        debug_push_length <- pending.length
+        debug_push_opcode <- pending.opcode
+    }
+    when commit & (count == 0) & (~debug_head_seen) {
+        debug_head_seen <- 1
+        debug_head_address <- pending.address
+        debug_head_auxiliary <- pending.auxiliary
+        debug_head_length <- pending.length
+        debug_head_opcode <- pending.opcode
+    }
+    when done_valid {
+        tag_done_count[done_tag] <- truncate<16>(tag_done_count[done_tag] + 1)
+    }
+
+    enqueued_valid <- mux(accept, 1, mux(launch, 0, enqueued_valid))
+    pending_valid <- mux(commit, 0, mux(launch, 1, pending_valid))
+    head_index <- mux(pop_entry, next_head_index, head_index)
+    tail_index <- mux(commit, truncate<2>(tail_index + 1), tail_index)
+    count <- mux(
+        commit & (~pop_entry),
+        truncate<3>(count + 1),
+        mux(pop_entry & (~commit), count - 1, count)
+    )
+    last_done <- mux(done_valid, done_tag, last_done)
+    out_valid <- mux(
+        out_valid & out_ready,
+        0,
+        mux((~out_valid) & dependency_ok, 1, out_valid)
+    )
+    head_dep_index <- mux(
+        pop_entry,
+        mux((count == 1) & commit, pending.dependency_tag,
+            next_head_command.dependency_tag),
+        mux(commit & (count == 0), pending.dependency_tag, head_dep_index)
+    )
+    head_dep_instance <- mux(
+        pop_entry,
+        mux((count == 1) & commit, pending.dependency_instance,
+            next_head_command.dependency_instance),
+        mux(commit & (count == 0), pending.dependency_instance, head_dep_instance)
+    )
+
+    in_ready = (~enqueued_valid) & enqueue_capacity
+    out_opcode = head_command.opcode
+    out_addr = head_command.address
+    out_aux = head_command.auxiliary
+    out_length = head_command.length
+    out_tag = head_command.tag
+    out_dep_tag = head_command.dependency_tag
+    out_src1_base = head_command.source1_base
+    out_scalar0 = head_command.scalar0
+    out_scalar1 = head_command.scalar1
+    out_scalar2 = head_command.scalar2
+    out_scalar3 = head_command.scalar3
+    out_mxu_valid = head_command.mxu_valid
+    out_mxu_a_base = head_command.mxu_a_base
+    out_mxu_b_base = head_command.mxu_b_base
+    out_mxu_c_base = head_command.mxu_c_base
+    out_mxu_acc_base = head_command.mxu_acc_base
+    out_mxu_a_stride = head_command.mxu_a_stride
+    out_mxu_b_stride = head_command.mxu_b_stride
+    out_mxu_k_dim = head_command.mxu_k_dim
+    out_mxu_accum_en = head_command.mxu_accum_en
+    out_mxu_acc_clear = head_command.mxu_acc_clear
+    out_mxu_spill_en = head_command.mxu_spill_en
+    out_mxu_restore_en = head_command.mxu_restore_en
+    out_mxu_rq_enable = head_command.mxu_rq_enable
+    out_mxu_rq_scale = head_command.mxu_rq_scale
+    out_mxu_rq_shift = head_command.mxu_rq_shift
+    out_mxu_rq_zero = head_command.mxu_rq_zero
+    out_mxu_mode = head_command.mxu_mode
+    out_mxu_a_transpose = head_command.mxu_a_transpose
+    out_mxu_b_transpose = head_command.mxu_b_transpose
+    out_mxu_zs_enable_a = head_command.mxu_zs_enable_a
+    out_mxu_zs_enable_b = head_command.mxu_zs_enable_b
+    out_adam_valid = head_command.adam_valid
+    out_adam_clear = head_command.adam_clear
+    out_adam_m_base = head_command.adam_m_base
+    out_adam_v_base = head_command.adam_v_base
+    out_adam_lr = head_command.adam_lr
+    out_adam_beta1 = head_command.adam_beta1
+    out_adam_beta2 = head_command.adam_beta2
+    out_adam_eps = head_command.adam_eps
+    debug_empty = count == 0
+    debug_head_valid = count != 0
+    debug_head_pointer = extend<16>(head_index)
+    debug_tail_pointer = extend<16>(tail_index)
+    debug_count = extend<16>(count)
+}

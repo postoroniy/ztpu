@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.queued_q16_slice
+
+// Standalone simulation environment: the production queue/engines/UB plus
+// bounded AXI memory. The host port is used only between queued commands.
+module ZtpuMicroGptDemo {
+    clock clk reset rst
+    in command_valid : bit
+    in command : ZtpuCommand
+    out command_ready : bit
+    out reg completed : u32 = 0
+    out cycles, errors : u32
+    in host_write : bit
+    in host_address : u14
+    in host_data : u32
+    out host_result : u32
+
+    inst dram : ZtpuUbMemoryReplica<T=u32,D=16384,IW=14,MW=4>
+
+    off : bit = 0
+    on : bit = 1
+    inst core : ZtpuQueuedQ16Slice<
+        TILE=2,OIW=1,ACC_DEPTH=4,AIW=2,LAST=1,NATIVE_I8=0,
+        UB_DEPTH=1024,UB_IW=10,UB_ROWS=256,UB_RW=8
+    >
+    core.command_valid = command_valid
+    core.command_opcode = command.opcode
+    core.command_address = command.address
+    core.command_auxiliary = command.auxiliary
+    core.command_length = command.length
+    core.command_tag = command.tag
+    core.command_dependency_tag = command.dependency_tag
+    core.command_src1_base = command.source1_base
+    core.command_scalar0 = command.scalar0
+    core.command_scalar1 = command.scalar1
+    core.command_scalar2 = command.scalar2
+    core.command_scalar3 = command.scalar3
+    core.command_mxu_valid = command.mxu_valid
+    core.command_mxu_a_base = command.mxu_a_base
+    core.command_mxu_b_base = command.mxu_b_base
+    core.command_mxu_c_base = command.mxu_c_base
+    core.command_mxu_acc_base = command.mxu_acc_base
+    core.command_mxu_a_stride = command.mxu_a_stride
+    core.command_mxu_b_stride = command.mxu_b_stride
+    core.command_mxu_k_dim = command.mxu_k_dim
+    core.command_mxu_accum_en = command.mxu_accum_en
+    core.command_mxu_acc_clear = command.mxu_acc_clear
+    core.command_mxu_spill_en = command.mxu_spill_en
+    core.command_mxu_restore_en = command.mxu_restore_en
+    core.command_mxu_mode = command.mxu_mode
+    core.command_mxu_a_transpose = command.mxu_a_transpose
+    core.command_mxu_b_transpose = command.mxu_b_transpose
+    core.command_mxu_zs_enable_a = command.mxu_zs_enable_a
+    core.command_mxu_zs_enable_b = command.mxu_zs_enable_b
+    core.command_adam_valid = off core.command_adam_clear = off
+    core.command_adam_m_base = 0 core.command_adam_v_base = 0
+    core.command_adam_lr = 0 core.command_adam_beta1 = 0
+    core.command_adam_beta2 = 0 core.command_adam_eps = 0
+
+    core.direct_dma_enable = off core.direct_dma_start = off core.direct_dma_store = off
+    core.direct_dma_dram_base = 0 core.direct_dma_ub_base = 0 core.direct_dma_length = 0
+    core.direct_mxu_enable = off core.direct_mxu_start = off
+    core.direct_mxu_accum_en = off core.direct_mxu_acc_clear = off
+    core.direct_mxu_spill_en = off core.direct_mxu_restore_en = off
+    core.direct_mxu_a_base = 0 core.direct_mxu_b_base = 0
+    core.direct_mxu_c_base = 0 core.direct_mxu_acc_base = 0
+    core.direct_mxu_a_stride = 0 core.direct_mxu_b_stride = 0
+    core.direct_mxu_k_dim = 0 core.direct_mxu_rq_enable = off
+    core.direct_mxu_rq_scale = 0 core.direct_mxu_rq_shift = 0
+    core.direct_mxu_rq_zero = 0 core.direct_mxu_mode = 0
+    core.direct_mxu_a_transpose = off core.direct_mxu_b_transpose = off
+    core.direct_mxu_zs_enable_a = off core.direct_mxu_zs_enable_b = off
+    core.direct_adam_enable = off core.direct_adam_start = off core.direct_adam_clear = off
+    core.direct_adam_w_base = 0 core.direct_adam_g_base = 0
+    core.direct_adam_m_base = 0 core.direct_adam_v_base = 0
+    core.direct_adam_length = 0 core.direct_adam_lr = 0
+    core.direct_adam_beta1 = 0 core.direct_adam_beta2 = 0 core.direct_adam_eps = 0
+    core.direct_vmu_enable = off core.direct_vmu_start = off core.direct_vmu_op = 0
+    core.direct_vmu_src0_base = 0 core.direct_vmu_src1_base = 0
+    core.direct_vmu_dst_base = 0 core.direct_vmu_length = 0
+    core.direct_vmu_scalar0 = 0 core.direct_vmu_scalar1 = 0
+    core.direct_vmu_scalar2 = 0 core.direct_vmu_scalar3 = 0
+    core.command_dma_start = off core.command_dma_clear = off
+    core.command_dma_base = 0 core.command_dma_count = 0
+    core.command_axi_ar_ready = off core.command_axi_r_valid = off
+    core.command_axi_r_data = 0 core.command_axi_r_last = off core.command_axi_r_resp = 0
+    core.dma_fence_enable = on core.dma_fence_base = 0 core.dma_fence_limit = 65536
+    core.dma_fence_ub_enable = off core.dma_fence_ub_base = 0 core.dma_fence_ub_limit = 0
+    core.dma_fence_ub_read_enable = off core.dma_fence_ub_write_enable = off
+    core.dma_fence_ub_read_base = 0 core.dma_fence_ub_read_limit = 0
+    core.dma_fence_ub_write_base = 0 core.dma_fence_ub_write_limit = 0
+    core.dma_fence_fault_clear_valid = off core.dma_fence_fault_clear_overflow = off
+    core.external_fence_fault = off core.external_fence_fault_write = off
+    core.external_fence_fault_master = 0 core.external_fence_fault_addr = 0
+    core.external_fence_fault_len = 0 core.external_fence_fault_size = 0
+    core.perf_enable = on core.perf_clear = off core.perf_clear_error = off
+    core.external_busy = off core.external_dma_read = off core.external_dma_write = off
+    core.external_error_event = off core.external_error_code = 0
+    core.external_layout_source_tiler = off core.external_layout_busy = off
+    core.external_layout_done = off core.external_layout_error = off
+    core.external_layout_dma_busy = off core.external_layout_dma_done = off
+    core.external_layout_dma_error = off
+    core.completion_enable = on core.completion_clear = off core.completion_pop = on
+
+    command_ready = core.command_ready
+    when core.completion_valid { completed <- truncate<32>(completed + 1) }
+    cycles = core.perf_cycles
+    errors = core.perf_error_count
+
+    reg reading : bit = 0
+    reg writing : bit = 0
+    reg response : bit = 0
+    reg read_address : u14 = 0
+    reg write_address : u14 = 0
+    reg read_left : u9 = 0
+    reg write_left : u9 = 0
+    read_accept : bit = core.axi_read.ar.valid & (~reading)
+    read_fire : bit = reading & core.axi_read.r.ready
+    write_accept : bit = core.axi_write.aw.valid & (~writing) & (~response)
+    write_fire : bit = core.axi_write.w.valid & writing
+
+    core.axi_read.ar.ready = ~reading
+    core.axi_read.r.valid = reading
+    core.axi_read.r.payload.data = dram.read_data
+    core.axi_read.r.payload.resp = 0
+    core.axi_read.r.payload.last = read_left == 1
+    core.axi_write.aw.ready = (~writing) & (~response)
+    core.axi_write.w.ready = writing
+    core.axi_write.b.valid = response
+    core.axi_write.b.payload.resp = 0
+
+    priority {
+        when read_accept {
+            reading <- 1
+            read_address <- truncate<14>(core.axi_read.ar.payload.addr >> 2)
+            read_left <- truncate<9>(extend<9>(core.axi_read.ar.payload.len) + 1)
+        }
+        when read_fire {
+            reading <- read_left != 1
+            read_left <- truncate<9>(read_left - 1)
+            read_address <- truncate<14>(read_address + 1)
+        }
+    }
+    priority {
+        when write_accept {
+            writing <- 1
+            write_address <- truncate<14>(core.axi_write.aw.payload.addr >> 2)
+            write_left <- truncate<9>(extend<9>(core.axi_write.aw.payload.len) + 1)
+        }
+        when write_fire {
+            writing <- write_left != 1
+            write_left <- truncate<9>(write_left - 1)
+            write_address <- truncate<14>(write_address + 1)
+        }
+    }
+    priority {
+        when write_fire & (write_left == 1) { response <- 1 }
+        when response & core.axi_write.b.ready { response <- 0 }
+    }
+    dram.read_row = mux(reading, read_address, host_address)
+    dram.write_enable = write_fire | host_write
+    dram.write_row = mux(write_fire, write_address, host_address)
+    dram.write_data = mux(write_fire, core.axi_write.w.payload.data, host_data)
+    dram.write_mask = 15
+    host_result = dram.read_data
+}

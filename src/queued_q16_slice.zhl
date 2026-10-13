@@ -1,0 +1,1193 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.cmd_dma
+import ztpu.axi_fence
+import ztpu.fault_status
+import ztpu.perfmon
+import ztpu.scheduler
+import ztpu.storage
+import ztpu.ub
+import ztpu.ub_adam
+import ztpu.ub_dcopy
+import ztpu.ub_dma
+import ztpu.ub_mxu_compute
+import ztpu.ub_vmu
+
+fn ztpu_mxu_mode_is_native_packed(mode : u3) -> bit {
+    (mode <= 2) | ((mode >= 4) & (mode <= 5))
+}
+import std.bus.axi_burst
+
+// Queued end-to-end ZTPU specialization for UB load/store, exact-Q16 MXU
+// compute, optional native packed-int8 MXU compute, ADAM updates, strided DRAM
+// copies, and Q16 VMU operations 0..14.
+module ZtpuQueuedQ16Slice<
+    TILE=2,
+    OIW=index_width(TILE),
+    ACC_DEPTH=TILE*TILE,
+    AIW=index_width(ACC_DEPTH),
+    LAST=TILE-1,
+    NATIVE_I8=0,
+    UB_DEPTH=256,
+    UB_IW=index_width(UB_DEPTH),
+    UB_ROWS=UB_DEPTH/4,
+    UB_RW=index_width(UB_ROWS)
+>
+where TILE >= 2 && is_power_of_two(TILE) && OIW == floor_log2(TILE) &&
+      ACC_DEPTH == TILE*TILE && AIW == floor_log2(ACC_DEPTH) &&
+      NATIVE_I8 >= 0 && NATIVE_I8 <= 1 &&
+      UB_DEPTH >= 8 && is_power_of_two(UB_DEPTH) &&
+      UB_IW == floor_log2(UB_DEPTH) && UB_ROWS == UB_DEPTH/4 &&
+      UB_RW == floor_log2(UB_ROWS) {
+    clock clk reset rst
+
+    in command_valid : bit
+    out command_ready : bit
+    out command_supported : bit
+    in command_opcode : bits<4>
+    in command_address : bits<64>
+    in command_auxiliary : bits<64>
+    in command_length : bits<16>
+    in command_tag : u8
+    in command_dependency_tag : u8
+    in command_src1_base : bits<64>
+    in command_scalar0, command_scalar1 : bits<32>
+    in command_scalar2, command_scalar3 : bits<32>
+    in command_mxu_valid : bit
+    in command_mxu_a_base, command_mxu_b_base : bits<64>
+    in command_mxu_c_base, command_mxu_acc_base : bits<64>
+    in command_mxu_a_stride, command_mxu_b_stride : bits<32>
+    in command_mxu_k_dim : bits<32>
+    in command_mxu_accum_en, command_mxu_acc_clear : bit
+    in command_mxu_spill_en, command_mxu_restore_en : bit
+    in command_mxu_mode : bits<3>
+    in command_mxu_a_transpose, command_mxu_b_transpose : bit
+    in command_mxu_zs_enable_a, command_mxu_zs_enable_b : bit
+    in command_adam_valid, command_adam_clear : bit
+    in command_adam_m_base, command_adam_v_base : bits<64>
+    in command_adam_lr, command_adam_beta1 : bits<32>
+    in command_adam_beta2, command_adam_eps : bits<32>
+
+    // Direct-register UB DMA path. It shares the same engine, UB,
+    // fences, AXI master, and status signals as queued opcodes 3/4 without
+    // entering the command or completion queues.
+    in direct_dma_enable, direct_dma_start, direct_dma_store : bit
+    in direct_dma_dram_base, direct_dma_ub_base : uint<64>
+    in direct_dma_length : u32
+    out direct_dma_busy, direct_dma_done, direct_dma_error : bit
+    out direct_dma_error_code : u8
+
+    in direct_mxu_enable, direct_mxu_start : bit
+    in direct_mxu_accum_en, direct_mxu_acc_clear : bit
+    in direct_mxu_spill_en, direct_mxu_restore_en : bit
+    in direct_mxu_a_base, direct_mxu_b_base : uint<64>
+    in direct_mxu_c_base, direct_mxu_acc_base : uint<64>
+    in direct_mxu_a_stride, direct_mxu_b_stride : u32
+    in direct_mxu_k_dim : u32
+    in direct_mxu_rq_enable : bit
+    in direct_mxu_rq_scale : bits<32>
+    in direct_mxu_rq_shift : u8
+    in direct_mxu_rq_zero : bits<32>
+    in direct_mxu_mode : u3
+    in direct_mxu_a_transpose, direct_mxu_b_transpose : bit
+    in direct_mxu_zs_enable_a, direct_mxu_zs_enable_b : bit
+    out direct_mxu_busy, direct_mxu_done, direct_mxu_error : bit
+
+    in direct_adam_enable, direct_adam_start, direct_adam_clear : bit
+    in direct_adam_w_base, direct_adam_g_base : uint<64>
+    in direct_adam_m_base, direct_adam_v_base : uint<64>
+    in direct_adam_length : u32
+    in direct_adam_lr, direct_adam_beta1 : bits<32>
+    in direct_adam_beta2, direct_adam_eps : bits<32>
+    out direct_adam_busy, direct_adam_done, direct_adam_error : bit
+    out direct_adam_b1t, direct_adam_b2t : u32
+
+    in direct_vmu_enable, direct_vmu_start : bit
+    in direct_vmu_op : u4
+    in direct_vmu_src0_base, direct_vmu_src1_base : uint<64>
+    in direct_vmu_dst_base : uint<64>
+    in direct_vmu_length : u32
+    in direct_vmu_scalar0, direct_vmu_scalar1 : bits<32>
+    in direct_vmu_scalar2, direct_vmu_scalar3 : bits<32>
+    out direct_vmu_busy, direct_vmu_done, direct_vmu_error : bit
+
+    in command_dma_start, command_dma_clear : bit
+    in command_dma_base : uint<64>
+    in command_dma_count : uint<24>
+    out command_dma_busy, command_dma_done, command_dma_error : bit
+    out command_dma_error_code : u4
+    out command_dma_fetched_count : uint<24>
+
+    in dma_fence_enable : bit
+    in dma_fence_base, dma_fence_limit : uint<64>
+    in dma_fence_ub_enable : bit
+    in dma_fence_ub_base, dma_fence_ub_limit : uint<64>
+    in dma_fence_ub_read_enable, dma_fence_ub_write_enable : bit
+    in dma_fence_ub_read_base, dma_fence_ub_read_limit : uint<64>
+    in dma_fence_ub_write_base, dma_fence_ub_write_limit : uint<64>
+    in dma_fence_fault_clear_valid, dma_fence_fault_clear_overflow : bit
+    in external_fence_fault, external_fence_fault_write : bit
+    in external_fence_fault_master : u4
+    in external_fence_fault_addr : uint<64>
+    in external_fence_fault_len : u8
+    in external_fence_fault_size : u3
+    out dma_fence_fault_valid, dma_fence_fault_overflow : bit
+    out dma_fence_fault_write : bit
+    out dma_fence_fault_master : u4
+    out dma_fence_fault_addr : uint<64>
+    out dma_fence_fault_len : u8
+    out dma_fence_fault_size : u3
+
+    in perf_enable, perf_clear, perf_clear_error : bit
+    in external_busy, external_dma_read, external_dma_write : bit
+    in external_error_event : bit
+    in external_error_code : u8
+    in external_layout_source_tiler : bit
+    in external_layout_busy, external_layout_done, external_layout_error : bit
+    in external_layout_dma_busy, external_layout_dma_done : bit
+    in external_layout_dma_error : bit
+    out external_layout_command_start : bit
+    out perf_cycles, perf_busy_cycles, perf_command_count : u32
+    out perf_dma_read_count, perf_dma_write_count, perf_error_count : u32
+    out perf_error_valid : bit
+    out perf_error_code : u8
+    out mxu_zs_steps, mxu_zs_total_macs : u32
+    out mxu_zs_active_macs, mxu_zs_skipped_macs : u32
+
+    out command_axi_ar_valid : bit
+    in command_axi_ar_ready : bit
+    out command_axi_ar_addr : uint<64>
+    out command_axi_ar_len : u8
+    out command_axi_ar_size : u3
+    in command_axi_r_valid : bit
+    out command_axi_r_ready : bit
+    in command_axi_r_data : u32
+    in command_axi_r_last : bit
+    in command_axi_r_resp : bits<2>
+
+    out command_count : u3
+    out last_done_tag : u8
+    out debug_queue_output_valid : bit
+    out debug_queue_output_address, debug_queue_output_auxiliary : bits<64>
+    out debug_queue_output_length : bits<16>
+    out debug_queue_output_opcode : bits<4>
+    out debug_queue_input_valid : bit
+    out debug_queue_input_address, debug_queue_input_auxiliary : bits<64>
+    out debug_queue_input_length : bits<16>
+    out debug_queue_input_opcode : bits<4>
+    out debug_queue_push_seen, debug_queue_head_seen : bit
+    out debug_queue_push_address, debug_queue_push_auxiliary : bits<64>
+    out debug_queue_head_address, debug_queue_head_auxiliary : bits<64>
+    out debug_queue_push_length, debug_queue_head_length : bits<16>
+    out debug_queue_push_opcode, debug_queue_head_opcode : bits<4>
+    out debug_queue_empty, debug_queue_head_valid : bit
+    out debug_queue_head_pointer, debug_queue_tail_pointer : u16
+    out debug_queue_count : u16
+    out debug_ub_launch_pending, debug_ub_capture_armed : bit
+    out debug_ub_capture_ok, debug_ub_capture, debug_ub_start : bit
+    out debug_ub_launch_dram_base, debug_ub_launch_ub_base : bits<64>
+    out debug_ub_launch_length : bits<16>
+    out reg debug_ub_start_seen : bit = 0
+    out reg debug_ub_start_store : bit = 0
+    out reg debug_ub_start_dram_base : bits<64> = 0
+    out reg debug_ub_start_ub_base : bits<64> = 0
+    out reg debug_ub_start_length : bits<16> = 0
+
+    in completion_enable, completion_clear, completion_pop : bit
+    out completion_valid : bit
+    out completion_tag : bits<8>
+    out completion_opcode : bits<4>
+    out completion_status : bits<4>
+    out completion_error : bits<8>
+    out completion_count : u4
+    out completion_overflow : bit
+
+    interface axi_read : AXI4BurstReadSubset<64,32>.master @clk
+    interface axi_write : AXI4BurstWriteSubset<64,32>.master @clk
+
+    inst command_queue : ZtpuCommandQueue4
+    inst command_dma : ZtpuCommandDescriptorDma64x24
+    inst completion_queue : ZtpuCompletionQueue8
+    inst unified_buffer : ZtpuUnifiedBufferNx32<
+        D=UB_DEPTH,IW=UB_IW,ROWS=UB_ROWS,RW=UB_RW
+    >
+    inst dma : ZtpuUnifiedBufferDma64x32
+    inst dcopy : ZtpuUbDcopy64x32
+    inst q16_compute : ZtpuUbMxuComputeQ16<
+        TILE=TILE, OIW=OIW, ACC_DEPTH=ACC_DEPTH, AIW=AIW, LAST=LAST
+    >
+    inst i8_compute : ZtpuUbMxuCompute4x4I8
+    inst adam : ZtpuUbAdamQ16
+    inst vmu : ZtpuUbVmuQ16
+    inst data_read_fence : ZtpuAxiReadFence64x32
+    inst data_write_fence : ZtpuAxiWriteFence64x32
+    inst command_read_fence : ZtpuAxiReadFence64x32
+    inst fence_fault_latch : ZtpuDmaFenceFaultLatch64
+    inst perf : ZtpuPerfCounters32x8
+
+    input_is_layout : bit = command_opcode == 1
+    input_is_layout_dma : bit = command_opcode == 2
+    input_is_load : bit = command_opcode == 3
+    input_is_store : bit = command_opcode == 4
+    input_is_compute : bit = (command_opcode == 5) & command_mxu_valid
+    input_is_adam : bit = (command_opcode == 6) & command_adam_valid
+    input_vmu_op : bits<4> = command_length[15:12]
+    input_vmu_op_supported : bit = bitcast<u4>(input_vmu_op) < 15
+    input_is_vmu : bit = (command_opcode == 7) & input_vmu_op_supported
+    input_is_dcopy : bit = command_opcode == 8
+    command_supported_value : bit = input_is_layout | input_is_layout_dma |
+        input_is_load | input_is_store | input_is_compute | input_is_adam |
+        input_is_vmu | input_is_dcopy
+
+    host_command_selected : bit = command_valid & command_supported_value
+    dma_command_selected : bit = command_dma.out_valid & (~host_command_selected)
+    command_queue.in_valid = host_command_selected | dma_command_selected
+    command_queue.in_opcode = mux(
+        host_command_selected, command_opcode, command_dma.out_opcode
+    )
+    command_queue.in_addr = mux(
+        host_command_selected, command_address, command_dma.out_addr
+    )
+    command_queue.in_aux = mux(
+        host_command_selected, command_auxiliary, command_dma.out_aux
+    )
+    command_queue.in_length = mux(
+        host_command_selected, command_length, command_dma.out_length
+    )
+    command_queue.in_tag = mux(
+        host_command_selected, command_tag, command_dma.out_tag
+    )
+    command_queue.in_dep_tag = mux(
+        host_command_selected, command_dependency_tag, command_dma.out_dep_tag
+    )
+    command_queue.in_src1_base = mux(
+        host_command_selected, command_src1_base, command_dma.out_src1_base
+    )
+    command_queue.in_scalar0 = mux(
+        host_command_selected, command_scalar0, command_dma.out_scalar0
+    )
+    command_queue.in_scalar1 = mux(
+        host_command_selected, command_scalar1, command_dma.out_scalar1
+    )
+    command_queue.in_scalar2 = mux(
+        host_command_selected, command_scalar2, command_dma.out_scalar2
+    )
+    command_queue.in_scalar3 = mux(
+        host_command_selected, command_scalar3, command_dma.out_scalar3
+    )
+    command_queue.in_mxu_valid = mux(
+        host_command_selected, command_mxu_valid, command_dma.out_mxu_valid
+    )
+    command_queue.in_mxu_a_base = mux(
+        host_command_selected, command_mxu_a_base, command_dma.out_mxu_a_base
+    )
+    command_queue.in_mxu_b_base = mux(
+        host_command_selected, command_mxu_b_base, command_dma.out_mxu_b_base
+    )
+    command_queue.in_mxu_c_base = mux(
+        host_command_selected, command_mxu_c_base, command_dma.out_mxu_c_base
+    )
+    command_queue.in_mxu_acc_base = mux(
+        host_command_selected,
+        command_mxu_acc_base,
+        command_dma.out_mxu_acc_base
+    )
+    command_queue.in_mxu_a_stride = mux(
+        host_command_selected,
+        command_mxu_a_stride,
+        command_dma.out_mxu_a_stride
+    )
+    command_queue.in_mxu_b_stride = mux(
+        host_command_selected,
+        command_mxu_b_stride,
+        command_dma.out_mxu_b_stride
+    )
+    command_queue.in_mxu_k_dim = mux(
+        host_command_selected, command_mxu_k_dim, command_dma.out_mxu_k_dim
+    )
+    command_queue.in_mxu_accum_en = mux(
+        host_command_selected,
+        command_mxu_accum_en,
+        command_dma.out_mxu_accum_en
+    )
+    command_queue.in_mxu_acc_clear = mux(
+        host_command_selected,
+        command_mxu_acc_clear,
+        command_dma.out_mxu_acc_clear
+    )
+    command_queue.in_mxu_spill_en = mux(
+        host_command_selected,
+        command_mxu_spill_en,
+        command_dma.out_mxu_spill_en
+    )
+    command_queue.in_mxu_restore_en = mux(
+        host_command_selected,
+        command_mxu_restore_en,
+        command_dma.out_mxu_restore_en
+    )
+    command_queue.in_mxu_rq_enable = mux(
+        host_command_selected, 0, command_dma.out_mxu_rq_enable
+    )
+    command_queue.in_mxu_rq_scale = mux(
+        host_command_selected, 0, command_dma.out_mxu_rq_scale
+    )
+    command_queue.in_mxu_rq_shift = mux(
+        host_command_selected, 0, command_dma.out_mxu_rq_shift
+    )
+    command_queue.in_mxu_rq_zero = mux(
+        host_command_selected, 0, command_dma.out_mxu_rq_zero
+    )
+    command_queue.in_mxu_mode = mux(
+        host_command_selected, command_mxu_mode, command_dma.out_mxu_mode
+    )
+    command_queue.in_mxu_a_transpose = mux(
+        host_command_selected,
+        command_mxu_a_transpose,
+        command_dma.out_mxu_a_transpose
+    )
+    command_queue.in_mxu_b_transpose = mux(
+        host_command_selected,
+        command_mxu_b_transpose,
+        command_dma.out_mxu_b_transpose
+    )
+    command_queue.in_mxu_zs_enable_a = mux(
+        host_command_selected,
+        command_mxu_zs_enable_a,
+        command_dma.out_mxu_zs_enable_a
+    )
+    command_queue.in_mxu_zs_enable_b = mux(
+        host_command_selected,
+        command_mxu_zs_enable_b,
+        command_dma.out_mxu_zs_enable_b
+    )
+    command_queue.in_adam_valid = mux(
+        host_command_selected, command_adam_valid, command_dma.out_adam_valid
+    )
+    command_queue.in_adam_clear = mux(
+        host_command_selected, command_adam_clear, command_dma.out_adam_clear
+    )
+    command_queue.in_adam_m_base = mux(
+        host_command_selected,
+        command_adam_m_base,
+        command_dma.out_adam_m_base
+    )
+    command_queue.in_adam_v_base = mux(
+        host_command_selected,
+        command_adam_v_base,
+        command_dma.out_adam_v_base
+    )
+    command_queue.in_adam_lr = mux(
+        host_command_selected, command_adam_lr, command_dma.out_adam_lr
+    )
+    command_queue.in_adam_beta1 = mux(
+        host_command_selected, command_adam_beta1, command_dma.out_adam_beta1
+    )
+    command_queue.in_adam_beta2 = mux(
+        host_command_selected, command_adam_beta2, command_dma.out_adam_beta2
+    )
+    command_queue.in_adam_eps = mux(
+        host_command_selected, command_adam_eps, command_dma.out_adam_eps
+    )
+
+    command_dma.start = command_dma_start
+    command_dma.clear = command_dma_clear
+    command_dma.base = command_dma_base
+    command_dma.count = command_dma_count
+    command_dma.out_ready = command_queue.in_ready & (~host_command_selected)
+    command_read_fence.enable = dma_fence_enable
+    command_read_fence.base = dma_fence_base
+    command_read_fence.limit = dma_fence_limit
+    command_read_fence.up_ar_valid = command_dma.axi_ar_valid
+    command_read_fence.up_ar_addr = command_dma.axi_ar_addr
+    command_read_fence.up_ar_len = command_dma.axi_ar_len
+    command_read_fence.up_ar_size = command_dma.axi_ar_size
+    command_read_fence.up_r_ready = command_dma.axi_r_ready
+    command_dma.axi_ar_ready = command_read_fence.up_ar_ready
+    command_dma.axi_r_valid = command_read_fence.up_r_valid
+    command_dma.axi_r_data = command_read_fence.up_r_data
+    command_dma.axi_r_last = command_read_fence.up_r_last
+    command_dma.axi_r_resp = command_read_fence.up_r_resp
+    command_read_fence.down_ar_ready = command_axi_ar_ready
+    command_read_fence.down_r_valid = command_axi_r_valid
+    command_read_fence.down_r_data = command_axi_r_data
+    command_read_fence.down_r_last = command_axi_r_last
+    command_read_fence.down_r_resp = command_axi_r_resp
+    command_axi_ar_valid = command_read_fence.down_ar_valid
+    command_axi_ar_addr = command_read_fence.down_ar_addr
+    command_axi_ar_len = command_read_fence.down_ar_len
+    command_axi_ar_size = command_read_fence.down_ar_size
+    command_axi_r_ready = command_read_fence.down_r_ready
+    command_dma_busy = command_dma.busy
+    command_dma_done = command_dma.done
+    command_dma_error = command_dma.error
+    command_dma_error_code = command_dma.error_code
+    command_dma_fetched_count = command_dma.fetched_count
+
+    queued_is_layout : bit = command_queue.out_opcode == 1
+    queued_is_layout_dma : bit = command_queue.out_opcode == 2
+    queued_is_load : bit = command_queue.out_opcode == 3
+    queued_is_store : bit = command_queue.out_opcode == 4
+    queued_is_compute : bit = command_queue.out_opcode == 5
+    queued_is_adam : bit = command_queue.out_opcode == 6
+    queued_is_vmu : bit = command_queue.out_opcode == 7
+    queued_is_dcopy : bit = command_queue.out_opcode == 8
+    queued_mxu_mode : u3 = bitcast<u3>(command_queue.out_mxu_mode)
+    queued_compute_is_i8 : bit = (NATIVE_I8 != 0) &
+        ztpu_mxu_mode_is_native_packed(queued_mxu_mode)
+    engine_busy : bit = dma.busy | dcopy.busy | q16_compute.busy |
+        i8_compute.busy | adam.busy | vmu.busy | external_layout_busy |
+        external_layout_dma_busy
+    layout_dispatch_blocked : bit = external_layout_source_tiler &
+        (queued_is_layout | queued_is_layout_dma)
+    direct_dma_request : bit = direct_dma_enable & direct_dma_start
+    direct_mxu_request : bit = direct_mxu_enable & direct_mxu_start
+    direct_adam_request : bit = direct_adam_enable & direct_adam_start
+    direct_vmu_request : bit = direct_vmu_enable & direct_vmu_start
+    direct_dispatch_blocked : bit = direct_dma_request | direct_mxu_request |
+        direct_adam_request | direct_vmu_request
+    direct_dma_fire : bit = direct_dma_request & (~engine_busy)
+    direct_mxu_fire : bit = direct_mxu_request & (~direct_dma_request) &
+        (~engine_busy)
+    direct_adam_fire : bit = direct_adam_request & (~direct_dma_request) &
+        (~direct_mxu_request) & (~engine_busy)
+    direct_vmu_fire : bit = direct_vmu_request & (~direct_dma_request) &
+        (~direct_mxu_request) & (~direct_adam_request) & (~engine_busy)
+    dispatch : bit = command_queue.out_valid & (~engine_busy) &
+        (~layout_dispatch_blocked) & (~direct_dispatch_blocked)
+    layout_command_start : bit = dispatch &
+        (queued_is_layout | queued_is_layout_dma)
+    queued_dma_start : bit = dispatch & (queued_is_load | queued_is_store)
+    queued_compute_start : bit = dispatch & queued_is_compute
+    direct_compute_is_i8 : bit = (NATIVE_I8 != 0) &
+        ztpu_mxu_mode_is_native_packed(direct_mxu_mode)
+    q16_compute_start : bit =
+        (queued_compute_start & (~queued_compute_is_i8)) |
+        (direct_mxu_fire & (~direct_compute_is_i8))
+    i8_compute_start : bit =
+        (queued_compute_start & queued_compute_is_i8) |
+        (direct_mxu_fire & direct_compute_is_i8)
+    queued_adam_start : bit = dispatch & queued_is_adam
+    adam_start : bit = queued_adam_start | direct_adam_fire
+    queued_vmu_start : bit = dispatch & queued_is_vmu
+    vmu_start : bit = queued_vmu_start | direct_vmu_fire
+    dcopy_start : bit = dispatch & queued_is_dcopy
+
+    when queued_dma_start | direct_dma_fire {
+        debug_ub_start_seen <- 1
+        debug_ub_start_store <- mux(
+            queued_dma_start, queued_is_store, direct_dma_store
+        )
+        debug_ub_start_dram_base <- mux(
+            queued_dma_start, command_queue.out_addr,
+            bitcast<bits<64>>(direct_dma_dram_base)
+        )
+        debug_ub_start_ub_base <- mux(
+            queued_dma_start, command_queue.out_aux,
+            bitcast<bits<64>>(direct_dma_ub_base)
+        )
+        debug_ub_start_length <- mux(
+            queued_dma_start, command_queue.out_length,
+            bitcast<bits<16>>(truncate<16>(direct_dma_length))
+        )
+    }
+
+    command_queue.out_ready = (~engine_busy) & (~layout_dispatch_blocked) &
+        (~direct_dispatch_blocked)
+    external_layout_command_start = layout_command_start
+
+    reg active_tag : u8 = 0
+    reg active_opcode : bits<4> = 0
+    reg active_mxu_a_base : uint<64> = 0
+    reg active_mxu_b_base : uint<64> = 0
+    reg active_mxu_c_base : uint<64> = 0
+    reg active_mxu_acc_base : uint<64> = 0
+    reg active_mxu_a_stride : uint<64> = 0
+    reg active_mxu_b_stride : uint<64> = 0
+    reg active_mxu_k_dim : u16 = 0
+    reg active_mxu_accum_en : bit = 0
+    reg active_mxu_acc_clear : bit = 0
+    reg active_mxu_spill_en : bit = 0
+    reg active_mxu_restore_en : bit = 0
+    reg active_mxu_rq_enable : bit = 0
+    reg active_mxu_rq_scale : s32 = 0
+    reg active_mxu_rq_shift : u8 = 0
+    reg active_mxu_rq_zero : s32 = 0
+    reg active_mxu_mode : u3 = 0
+    reg active_mxu_a_transpose : bit = 0
+    reg active_mxu_b_transpose : bit = 0
+    reg active_mxu_zs_enable_a : bit = 0
+    reg active_mxu_zs_enable_b : bit = 0
+    reg last_compute_is_i8 : bit = 0
+    reg active_adam_lr : s32 = 0
+    reg active_adam_beta1 : s32 = 0
+    reg active_adam_beta2 : s32 = 0
+    reg active_adam_eps : s32 = 0
+
+    when dispatch {
+        active_tag <- command_queue.out_tag
+        active_opcode <- command_queue.out_opcode
+    }
+    priority {
+        when dispatch {
+            active_mxu_a_base <- bitcast<uint<64>>(command_queue.out_mxu_a_base)
+            active_mxu_b_base <- bitcast<uint<64>>(command_queue.out_mxu_b_base)
+            active_mxu_c_base <- bitcast<uint<64>>(command_queue.out_mxu_c_base)
+            active_mxu_acc_base <- bitcast<uint<64>>(command_queue.out_mxu_acc_base)
+            active_mxu_a_stride <- extend<64>(bitcast<u32>(command_queue.out_mxu_a_stride))
+            active_mxu_b_stride <- extend<64>(bitcast<u32>(command_queue.out_mxu_b_stride))
+            active_mxu_k_dim <- truncate<16>(bitcast<u32>(command_queue.out_mxu_k_dim))
+            active_mxu_accum_en <- command_queue.out_mxu_accum_en
+            active_mxu_acc_clear <- command_queue.out_mxu_acc_clear
+            active_mxu_spill_en <- command_queue.out_mxu_spill_en
+            active_mxu_restore_en <- command_queue.out_mxu_restore_en
+            active_mxu_rq_enable <- command_queue.out_mxu_rq_enable
+            active_mxu_rq_scale <- bitcast<s32>(command_queue.out_mxu_rq_scale)
+            active_mxu_rq_shift <- bitcast<u8>(command_queue.out_mxu_rq_shift)
+            active_mxu_rq_zero <- bitcast<s32>(command_queue.out_mxu_rq_zero)
+            active_mxu_mode <- bitcast<u3>(command_queue.out_mxu_mode)
+            active_mxu_a_transpose <- command_queue.out_mxu_a_transpose
+            active_mxu_b_transpose <- command_queue.out_mxu_b_transpose
+            active_mxu_zs_enable_a <- command_queue.out_mxu_zs_enable_a
+            active_mxu_zs_enable_b <- command_queue.out_mxu_zs_enable_b
+        }
+        when direct_mxu_fire {
+            active_mxu_a_base <- direct_mxu_a_base
+            active_mxu_b_base <- direct_mxu_b_base
+            active_mxu_c_base <- direct_mxu_c_base
+            active_mxu_acc_base <- direct_mxu_acc_base
+            active_mxu_a_stride <- extend<64>(direct_mxu_a_stride)
+            active_mxu_b_stride <- extend<64>(direct_mxu_b_stride)
+            active_mxu_k_dim <- truncate<16>(direct_mxu_k_dim)
+            active_mxu_accum_en <- direct_mxu_accum_en
+            active_mxu_acc_clear <- direct_mxu_acc_clear
+            active_mxu_spill_en <- direct_mxu_spill_en
+            active_mxu_restore_en <- direct_mxu_restore_en
+            active_mxu_rq_enable <- direct_mxu_rq_enable
+            active_mxu_rq_scale <- bitcast<s32>(direct_mxu_rq_scale)
+            active_mxu_rq_shift <- direct_mxu_rq_shift
+            active_mxu_rq_zero <- bitcast<s32>(direct_mxu_rq_zero)
+            active_mxu_mode <- direct_mxu_mode
+            active_mxu_a_transpose <- direct_mxu_a_transpose
+            active_mxu_b_transpose <- direct_mxu_b_transpose
+            active_mxu_zs_enable_a <- direct_mxu_zs_enable_a
+            active_mxu_zs_enable_b <- direct_mxu_zs_enable_b
+        }
+    }
+    priority {
+        when dispatch {
+            active_adam_lr <- bitcast<s32>(command_queue.out_adam_lr)
+            active_adam_beta1 <- bitcast<s32>(command_queue.out_adam_beta1)
+            active_adam_beta2 <- bitcast<s32>(command_queue.out_adam_beta2)
+            active_adam_eps <- bitcast<s32>(command_queue.out_adam_eps)
+        }
+        when direct_adam_fire {
+            active_adam_lr <- bitcast<s32>(direct_adam_lr)
+            active_adam_beta1 <- bitcast<s32>(direct_adam_beta1)
+            active_adam_beta2 <- bitcast<s32>(direct_adam_beta2)
+            active_adam_eps <- bitcast<s32>(direct_adam_eps)
+        }
+    }
+    priority {
+        when queued_compute_start { last_compute_is_i8 <- queued_compute_is_i8 }
+        when direct_mxu_fire { last_compute_is_i8 <- direct_compute_is_i8 }
+    }
+
+    dcopy.start = dcopy_start
+    dcopy.source_base = bitcast<uint<64>>(command_queue.out_addr)
+    dcopy.destination_base = bitcast<uint<64>>(command_queue.out_src1_base)
+    dcopy.ub_base = bitcast<uint<64>>(command_queue.out_aux)
+    dcopy.row_bytes = bitcast<u16>(command_queue.out_length)
+    dcopy.row_count = bitcast<u32>(command_queue.out_scalar0)
+    dcopy.source_stride = extend<64>(bitcast<u32>(command_queue.out_scalar1))
+    dcopy.destination_stride = extend<64>(
+        bitcast<u32>(command_queue.out_scalar2)
+    )
+    dcopy.dma_busy = dma.busy
+    dcopy.dma_done = dma.done
+    dcopy.dma_error = dma.error
+    dcopy.dma_error_code = dma.error_code
+
+    dma_start : bit = direct_dma_fire | queued_dma_start | dcopy.dma_start
+    dma.start = dma_start
+    dma.direction = mux(
+        direct_dma_fire,
+        direct_dma_store,
+        mux(dcopy.dma_start, dcopy.dma_direction, queued_is_store)
+    )
+    dma.dram_base = mux(
+        direct_dma_fire,
+        direct_dma_dram_base,
+        mux(
+            dcopy.dma_start,
+            dcopy.dma_dram_base,
+            bitcast<uint<64>>(command_queue.out_addr)
+        )
+    )
+    dma.ub_base = mux(
+        direct_dma_fire,
+        direct_dma_ub_base,
+        mux(
+            dcopy.dma_start,
+            dcopy.dma_ub_base,
+            bitcast<uint<64>>(command_queue.out_aux)
+        )
+    )
+    dma.length_bytes = mux(
+        direct_dma_fire,
+        truncate<16>(direct_dma_length),
+        mux(
+            dcopy.dma_start,
+            dcopy.dma_length_bytes,
+            bitcast<u16>(command_queue.out_length)
+        )
+    )
+    direct_dma_busy = dma.busy
+    direct_dma_done = dma.done
+    direct_dma_error = dma.error
+    direct_dma_error_code = dma.error_code
+
+    maximum_address : uint<64> = bitcast<uint<64>>(0xffffffffffffffff)
+    global_fence_base : uint<64> = mux(dma_fence_enable, dma_fence_base, 0)
+    global_fence_limit : uint<64> = mux(
+        dma_fence_enable, dma_fence_limit, maximum_address
+    )
+    ub_fence_base : uint<64> = mux(
+        dma_fence_ub_enable, dma_fence_ub_base, 0
+    )
+    ub_fence_limit : uint<64> = mux(
+        dma_fence_ub_enable, dma_fence_ub_limit, maximum_address
+    )
+    ub_read_master_base : uint<64> = mux(
+        dma_fence_ub_read_enable, dma_fence_ub_read_base, 0
+    )
+    ub_read_master_limit : uint<64> = mux(
+        dma_fence_ub_read_enable, dma_fence_ub_read_limit, maximum_address
+    )
+    ub_write_master_base : uint<64> = mux(
+        dma_fence_ub_write_enable, dma_fence_ub_write_base, 0
+    )
+    ub_write_master_limit : uint<64> = mux(
+        dma_fence_ub_write_enable, dma_fence_ub_write_limit, maximum_address
+    )
+    ub_read_fence_base : uint<64> = ztpu_fence_max3(
+        global_fence_base, ub_fence_base, ub_read_master_base
+    )
+    ub_read_fence_limit : uint<64> = ztpu_fence_min3(
+        global_fence_limit, ub_fence_limit, ub_read_master_limit
+    )
+    ub_write_fence_base : uint<64> = ztpu_fence_max3(
+        global_fence_base, ub_fence_base, ub_write_master_base
+    )
+    ub_write_fence_limit : uint<64> = ztpu_fence_min3(
+        global_fence_limit, ub_fence_limit, ub_write_master_limit
+    )
+
+    data_read_fence.enable = dma_fence_enable | dma_fence_ub_enable |
+        dma_fence_ub_read_enable
+    data_read_fence.base = ub_read_fence_base
+    data_read_fence.limit = ub_read_fence_limit
+    data_read_fence.up_ar_valid = dma.axi_read_ar_valid
+    data_read_fence.up_ar_addr = dma.axi_read_ar_addr
+    data_read_fence.up_ar_len = dma.axi_read_ar_len
+    data_read_fence.up_ar_size = dma.axi_read_ar_size
+    data_read_fence.up_r_ready = dma.axi_read_r_ready
+    dma.axi_read_ar_ready = data_read_fence.up_ar_ready
+    dma.axi_read_r_valid = data_read_fence.up_r_valid
+    dma.axi_read_r_data = data_read_fence.up_r_data
+    dma.axi_read_r_last = data_read_fence.up_r_last
+    dma.axi_read_r_resp = data_read_fence.up_r_resp
+    data_read_fence.down_ar_ready = axi_read.ar.ready
+    data_read_fence.down_r_valid = axi_read.r.valid
+    data_read_fence.down_r_data = axi_read.r.payload.data
+    data_read_fence.down_r_last = axi_read.r.payload.last
+    data_read_fence.down_r_resp = axi_read.r.payload.resp
+    axi_read.ar.valid = data_read_fence.down_ar_valid
+    axi_read.ar.payload = AxiBurstAddress {
+        addr = data_read_fence.down_ar_addr
+        len = data_read_fence.down_ar_len
+        size = data_read_fence.down_ar_size
+    }
+    axi_read.r.ready = data_read_fence.down_r_ready
+
+    data_write_fence.enable = dma_fence_enable | dma_fence_ub_enable |
+        dma_fence_ub_write_enable
+    data_write_fence.base = ub_write_fence_base
+    data_write_fence.limit = ub_write_fence_limit
+    data_write_fence.up_aw_valid = dma.axi_write_aw_valid
+    data_write_fence.up_aw_addr = dma.axi_write_aw_addr
+    data_write_fence.up_aw_len = dma.axi_write_aw_len
+    data_write_fence.up_aw_size = dma.axi_write_aw_size
+    data_write_fence.up_w_valid = dma.axi_write_w_valid
+    data_write_fence.up_w_data = dma.axi_write_w_data
+    data_write_fence.up_w_last = dma.axi_write_w_last
+    data_write_fence.up_b_ready = dma.axi_write_b_ready
+    dma.axi_write_aw_ready = data_write_fence.up_aw_ready
+    dma.axi_write_w_ready = data_write_fence.up_w_ready
+    dma.axi_write_b_valid = data_write_fence.up_b_valid
+    dma.axi_write_b_resp = data_write_fence.up_b_resp
+    data_write_fence.down_aw_ready = axi_write.aw.ready
+    data_write_fence.down_w_ready = axi_write.w.ready
+    data_write_fence.down_b_valid = axi_write.b.valid
+    data_write_fence.down_b_resp = axi_write.b.payload.resp
+    axi_write.aw.valid = data_write_fence.down_aw_valid
+    axi_write.aw.payload = AxiBurstAddress {
+        addr = data_write_fence.down_aw_addr
+        len = data_write_fence.down_aw_len
+        size = data_write_fence.down_aw_size
+    }
+    axi_write.w.valid = data_write_fence.down_w_valid
+    axi_write.w.payload = AxiBurstWriteData {
+        data = data_write_fence.down_w_data
+        last = data_write_fence.down_w_last
+    }
+    axi_write.b.ready = data_write_fence.down_b_ready
+
+    selected_mxu_a_base : uint<64> = mux(direct_mxu_fire,
+        direct_mxu_a_base, mux(queued_compute_start,
+        bitcast<uint<64>>(command_queue.out_mxu_a_base), active_mxu_a_base))
+    selected_mxu_b_base : uint<64> = mux(direct_mxu_fire,
+        direct_mxu_b_base, mux(queued_compute_start,
+        bitcast<uint<64>>(command_queue.out_mxu_b_base), active_mxu_b_base))
+    selected_mxu_c_base : uint<64> = mux(direct_mxu_fire,
+        direct_mxu_c_base, mux(queued_compute_start,
+        bitcast<uint<64>>(command_queue.out_mxu_c_base), active_mxu_c_base))
+    selected_mxu_acc_base : uint<64> = mux(direct_mxu_fire,
+        direct_mxu_acc_base, mux(queued_compute_start,
+        bitcast<uint<64>>(command_queue.out_mxu_acc_base), active_mxu_acc_base))
+    selected_mxu_a_stride : uint<64> = mux(direct_mxu_fire,
+        extend<64>(direct_mxu_a_stride), mux(queued_compute_start,
+        extend<64>(bitcast<u32>(command_queue.out_mxu_a_stride)),
+        active_mxu_a_stride))
+    selected_mxu_b_stride : uint<64> = mux(direct_mxu_fire,
+        extend<64>(direct_mxu_b_stride), mux(queued_compute_start,
+        extend<64>(bitcast<u32>(command_queue.out_mxu_b_stride)),
+        active_mxu_b_stride))
+    selected_mxu_k_dim : u16 = mux(direct_mxu_fire,
+        truncate<16>(direct_mxu_k_dim), mux(queued_compute_start,
+        truncate<16>(bitcast<u32>(command_queue.out_mxu_k_dim)),
+        active_mxu_k_dim))
+    selected_mxu_accum_en : bit = mux(direct_mxu_fire,
+        direct_mxu_accum_en, mux(queued_compute_start,
+        command_queue.out_mxu_accum_en, active_mxu_accum_en))
+    selected_mxu_acc_clear : bit = mux(direct_mxu_fire,
+        direct_mxu_acc_clear, mux(queued_compute_start,
+        command_queue.out_mxu_acc_clear, active_mxu_acc_clear))
+    selected_mxu_spill_en : bit = mux(direct_mxu_fire,
+        direct_mxu_spill_en, mux(queued_compute_start,
+        command_queue.out_mxu_spill_en, active_mxu_spill_en))
+    selected_mxu_restore_en : bit = mux(direct_mxu_fire,
+        direct_mxu_restore_en, mux(queued_compute_start,
+        command_queue.out_mxu_restore_en, active_mxu_restore_en))
+    selected_mxu_mode : u3 = mux(direct_mxu_fire,
+        direct_mxu_mode, mux(queued_compute_start,
+        bitcast<u3>(command_queue.out_mxu_mode), active_mxu_mode))
+    selected_mxu_a_transpose : bit = mux(direct_mxu_fire,
+        direct_mxu_a_transpose, mux(queued_compute_start,
+        command_queue.out_mxu_a_transpose, active_mxu_a_transpose))
+    selected_mxu_b_transpose : bit = mux(direct_mxu_fire,
+        direct_mxu_b_transpose, mux(queued_compute_start,
+        command_queue.out_mxu_b_transpose, active_mxu_b_transpose))
+    selected_mxu_rq_enable : bit = mux(direct_mxu_fire,
+        direct_mxu_rq_enable, mux(queued_compute_start,
+        command_queue.out_mxu_rq_enable, active_mxu_rq_enable))
+    selected_mxu_rq_scale : s32 = mux(direct_mxu_fire,
+        bitcast<s32>(direct_mxu_rq_scale), mux(queued_compute_start,
+        bitcast<s32>(command_queue.out_mxu_rq_scale), active_mxu_rq_scale))
+    selected_mxu_rq_shift : u8 = mux(direct_mxu_fire,
+        direct_mxu_rq_shift, mux(queued_compute_start,
+        bitcast<u8>(command_queue.out_mxu_rq_shift), active_mxu_rq_shift))
+    selected_mxu_rq_zero : s32 = mux(direct_mxu_fire,
+        bitcast<s32>(direct_mxu_rq_zero), mux(queued_compute_start,
+        bitcast<s32>(command_queue.out_mxu_rq_zero), active_mxu_rq_zero))
+    selected_mxu_zs_enable_a : bit = mux(direct_mxu_fire,
+        direct_mxu_zs_enable_a, mux(queued_compute_start,
+        command_queue.out_mxu_zs_enable_a, active_mxu_zs_enable_a))
+    selected_mxu_zs_enable_b : bit = mux(direct_mxu_fire,
+        direct_mxu_zs_enable_b, mux(queued_compute_start,
+        command_queue.out_mxu_zs_enable_b, active_mxu_zs_enable_b))
+
+    q16_compute.start = q16_compute_start
+    q16_compute.a_base = selected_mxu_a_base
+    q16_compute.b_base = selected_mxu_b_base
+    q16_compute.c_base = selected_mxu_c_base
+    q16_compute.acc_base = selected_mxu_acc_base
+    q16_compute.a_stride = selected_mxu_a_stride
+    q16_compute.b_stride = selected_mxu_b_stride
+    q16_compute.k_dim = selected_mxu_k_dim
+    q16_compute.accum_enable = selected_mxu_accum_en
+    q16_compute.acc_clear = selected_mxu_acc_clear
+    q16_compute.spill_enable = selected_mxu_spill_en
+    q16_compute.restore_enable = selected_mxu_restore_en
+    q16_compute.mode = selected_mxu_mode
+    q16_compute.a_transpose = selected_mxu_a_transpose
+    q16_compute.b_transpose = selected_mxu_b_transpose
+
+    i8_compute.start = i8_compute_start
+    i8_compute.a_base = selected_mxu_a_base
+    i8_compute.b_base = selected_mxu_b_base
+    i8_compute.c_base = selected_mxu_c_base
+    i8_compute.acc_base = selected_mxu_acc_base
+    i8_compute.a_stride = selected_mxu_a_stride
+    i8_compute.b_stride = selected_mxu_b_stride
+    i8_compute.k_dim = selected_mxu_k_dim
+    i8_compute.accum_enable = selected_mxu_accum_en
+    i8_compute.acc_clear = selected_mxu_acc_clear
+    i8_compute.spill_enable = selected_mxu_spill_en
+    i8_compute.restore_enable = selected_mxu_restore_en
+    i8_compute.mode = selected_mxu_mode
+    i8_compute.a_transpose = selected_mxu_a_transpose
+    i8_compute.b_transpose = selected_mxu_b_transpose
+    i8_compute.rq_enable = selected_mxu_rq_enable
+    i8_compute.rq_scale = selected_mxu_rq_scale
+    i8_compute.rq_shift = selected_mxu_rq_shift
+    i8_compute.rq_zero = selected_mxu_rq_zero
+    i8_compute.zs_enable_a = selected_mxu_zs_enable_a
+    i8_compute.zs_enable_b = selected_mxu_zs_enable_b
+    mxu_zs_steps = mux(last_compute_is_i8, i8_compute.zs_steps, 0)
+    mxu_zs_total_macs = mux(last_compute_is_i8, i8_compute.zs_total_macs, 0)
+    mxu_zs_active_macs = mux(last_compute_is_i8, i8_compute.zs_active_macs, 0)
+    mxu_zs_skipped_macs = mux(
+        last_compute_is_i8, i8_compute.zs_skipped_macs, 0
+    )
+    direct_mxu_busy = q16_compute.busy | i8_compute.busy
+    direct_mxu_done = q16_compute.done | i8_compute.done
+    direct_mxu_error = 0
+
+    adam.start = adam_start
+    adam.clear_state = mux(
+        direct_adam_fire, direct_adam_clear,
+        queued_adam_start & command_queue.out_adam_clear
+    )
+    adam.w_base = mux(direct_adam_fire, direct_adam_w_base,
+        bitcast<uint<64>>(command_queue.out_addr))
+    adam.g_base = mux(direct_adam_fire, direct_adam_g_base,
+        bitcast<uint<64>>(command_queue.out_aux))
+    adam.m_base = mux(direct_adam_fire, direct_adam_m_base,
+        bitcast<uint<64>>(command_queue.out_adam_m_base))
+    adam.v_base = mux(direct_adam_fire, direct_adam_v_base,
+        bitcast<uint<64>>(command_queue.out_adam_v_base))
+    adam.length = mux(direct_adam_fire, truncate<16>(direct_adam_length),
+        bitcast<u16>(command_queue.out_length))
+    adam.learning_rate = mux(
+        direct_adam_fire, bitcast<s32>(direct_adam_lr),
+        mux(queued_adam_start, bitcast<s32>(command_queue.out_adam_lr), active_adam_lr)
+    )
+    adam.beta1 = mux(
+        direct_adam_fire, bitcast<s32>(direct_adam_beta1),
+        mux(queued_adam_start, bitcast<s32>(command_queue.out_adam_beta1), active_adam_beta1)
+    )
+    adam.beta2 = mux(
+        direct_adam_fire, bitcast<s32>(direct_adam_beta2),
+        mux(queued_adam_start, bitcast<s32>(command_queue.out_adam_beta2), active_adam_beta2)
+    )
+    adam.epsilon = mux(
+        direct_adam_fire, bitcast<s32>(direct_adam_eps),
+        mux(queued_adam_start, bitcast<s32>(command_queue.out_adam_eps), active_adam_eps)
+    )
+    direct_adam_busy = adam.busy
+    direct_adam_done = adam.done
+    direct_adam_error = adam.error
+    direct_adam_b1t = adam.b1t
+    direct_adam_b2t = adam.b2t
+
+    vmu.start = vmu_start
+    vmu.enable = mux(direct_vmu_fire, direct_vmu_enable, 1)
+    vmu.op = mux(direct_vmu_fire, direct_vmu_op,
+        bitcast<u4>(command_queue.out_length[15:12]))
+    vmu.src0_base = mux(direct_vmu_fire, direct_vmu_src0_base,
+        bitcast<uint<64>>(command_queue.out_addr))
+    vmu.src1_base = mux(direct_vmu_fire, direct_vmu_src1_base,
+        bitcast<uint<64>>(command_queue.out_src1_base))
+    vmu.dst_base = mux(direct_vmu_fire, direct_vmu_dst_base,
+        bitcast<uint<64>>(command_queue.out_aux))
+    vmu.length = mux(direct_vmu_fire, truncate<16>(direct_vmu_length),
+        extend<16>(bitcast<uint<12>>(command_queue.out_length[11:0])))
+    vmu.scalar0 = mux(direct_vmu_fire, bitcast<s32>(direct_vmu_scalar0),
+        bitcast<s32>(command_queue.out_scalar0))
+    vmu.scalar1 = mux(direct_vmu_fire, bitcast<s32>(direct_vmu_scalar1),
+        bitcast<s32>(command_queue.out_scalar1))
+    vmu.scalar2 = mux(direct_vmu_fire, bitcast<u32>(direct_vmu_scalar2),
+        bitcast<u32>(command_queue.out_scalar2))
+    vmu.scalar3 = mux(direct_vmu_fire, bitcast<u32>(direct_vmu_scalar3),
+        bitcast<u32>(command_queue.out_scalar3))
+    direct_vmu_busy = vmu.busy
+    direct_vmu_done = vmu.done
+    direct_vmu_error = vmu.error
+
+    use_dma : bit = dma.busy | dma_start
+    use_q16_compute : bit = q16_compute.busy | q16_compute_start
+    use_i8_compute : bit = i8_compute.busy | i8_compute_start
+    use_compute : bit = use_q16_compute | use_i8_compute
+    compute_read_a_valid : bit = mux(
+        use_i8_compute, i8_compute.ub_read_a_valid,
+        q16_compute.ub_read_a_valid
+    )
+    compute_read_a_addr : uint<64> = mux(
+        use_i8_compute, i8_compute.ub_read_a_addr,
+        q16_compute.ub_read_a_addr
+    )
+    compute_read_b_valid : bit = mux(
+        use_i8_compute, i8_compute.ub_read_b_valid,
+        q16_compute.ub_read_b_valid
+    )
+    compute_read_b_addr : uint<64> = mux(
+        use_i8_compute, i8_compute.ub_read_b_addr,
+        q16_compute.ub_read_b_addr
+    )
+    compute_write_valid : bit = mux(
+        use_i8_compute, i8_compute.ub_write_valid,
+        q16_compute.ub_write_valid
+    )
+    compute_write_addr : uint<64> = mux(
+        use_i8_compute, i8_compute.ub_write_addr,
+        q16_compute.ub_write_addr
+    )
+    compute_write_data : bits<32> = mux(
+        use_i8_compute, i8_compute.ub_write_data,
+        q16_compute.ub_write_data
+    )
+    compute_write_mask : bits<4> = mux(
+        use_i8_compute, i8_compute.ub_write_mask,
+        q16_compute.ub_write_mask
+    )
+    use_adam : bit = adam.busy | adam_start
+    use_vmu : bit = vmu.busy | vmu_start
+    unified_buffer.read0_valid = mux(
+        use_dma, dma.ub_read_valid,
+        mux(use_compute, compute_read_a_valid,
+            mux(use_adam, adam.ub_read0_valid, vmu.ub_read0_valid))
+    )
+    unified_buffer.read0_addr = mux(
+        use_dma, dma.ub_read_addr,
+        mux(use_compute, compute_read_a_addr,
+            mux(use_adam, adam.ub_read0_addr, vmu.ub_read0_addr))
+    )
+    unified_buffer.read1_valid = mux(
+        use_compute, compute_read_b_valid,
+        mux(use_adam, adam.ub_read1_valid, vmu.ub_read1_valid)
+    )
+    unified_buffer.read1_addr = mux(
+        use_compute, compute_read_b_addr,
+        mux(use_adam, adam.ub_read1_addr, vmu.ub_read1_addr)
+    )
+    unified_buffer.write_valid = mux(
+        use_dma, dma.ub_write_valid,
+        mux(use_compute, compute_write_valid,
+            mux(use_adam, adam.ub_write_valid, vmu.ub_write_valid))
+    )
+    unified_buffer.write_addr = mux(
+        use_dma, dma.ub_write_addr,
+        mux(use_compute, compute_write_addr,
+            mux(use_adam, adam.ub_write_addr, vmu.ub_write_addr))
+    )
+    unified_buffer.write_data = bitcast<u32>(
+        mux(
+            use_dma, dma.ub_write_data,
+            mux(use_compute, compute_write_data,
+                mux(use_adam, adam.ub_write_data, vmu.ub_write_data))
+        )
+    )
+    unified_buffer.write_mask = mux(
+        use_dma, dma.ub_write_mask,
+        mux(use_compute, compute_write_mask,
+            mux(use_adam, adam.ub_write_mask, vmu.ub_write_mask))
+    )
+
+    dma.ub_read_ready = use_dma & unified_buffer.read0_ready
+    dma.ub_read_data = unified_buffer.read0_data
+    dma.ub_write_ready = use_dma & unified_buffer.write_ready
+    q16_compute.ub_read_a_ready = use_q16_compute & unified_buffer.read0_ready
+    q16_compute.ub_read_a_data = unified_buffer.read0_data
+    q16_compute.ub_read_b_ready = use_q16_compute & unified_buffer.read1_ready
+    q16_compute.ub_read_b_data = unified_buffer.read1_data
+    q16_compute.ub_write_ready = use_q16_compute & unified_buffer.write_ready
+    i8_compute.ub_read_a_ready = use_i8_compute & unified_buffer.read0_ready
+    i8_compute.ub_read_a_data = unified_buffer.read0_data
+    i8_compute.ub_read_b_ready = use_i8_compute & unified_buffer.read1_ready
+    i8_compute.ub_read_b_data = unified_buffer.read1_data
+    i8_compute.ub_write_ready = use_i8_compute & unified_buffer.write_ready
+    adam.ub_read0_ready = use_adam & unified_buffer.read0_ready
+    adam.ub_read0_data = unified_buffer.read0_data
+    adam.ub_read1_ready = use_adam & unified_buffer.read1_ready
+    adam.ub_read1_data = unified_buffer.read1_data
+    adam.ub_write_ready = use_adam & unified_buffer.write_ready
+    vmu.ub_read0_ready = use_vmu & unified_buffer.read0_ready
+    vmu.ub_read0_data = unified_buffer.read0_data
+    vmu.ub_read1_ready = use_vmu & unified_buffer.read1_ready
+    vmu.ub_read1_data = unified_buffer.read1_data
+    vmu.ub_write_ready = use_vmu & unified_buffer.write_ready
+
+    active_is_layout : bit = active_opcode == 1
+    active_is_layout_dma : bit = active_opcode == 2
+    active_is_direct_dma : bit = (active_opcode == 3) | (active_opcode == 4)
+    active_compute_is_i8 : bit = (NATIVE_I8 != 0) &
+        ztpu_mxu_mode_is_native_packed(active_mxu_mode)
+    selected_compute_done : bit = mux(
+        active_compute_is_i8, i8_compute.done, q16_compute.done
+    )
+    command_done : bit = mux(active_is_layout, external_layout_done,
+        mux(active_is_layout_dma, external_layout_dma_done,
+        mux(active_is_direct_dma, dma.done,
+        mux(active_opcode == 5, selected_compute_done,
+        mux(active_opcode == 6, adam.done,
+        mux(active_opcode == 7, vmu.done,
+        mux(active_opcode == 8, dcopy.done, 0)))))))
+    command_failed : bit = command_done & mux(
+        active_is_layout, external_layout_error,
+        mux(active_is_layout_dma, external_layout_dma_error,
+        mux(active_is_direct_dma, dma.error,
+        mux(active_opcode == 6, adam.error,
+        mux(active_opcode == 7, vmu.error,
+        mux(active_opcode == 8, dcopy.error, 0)))))
+    )
+    selected_error_code : u8 = mux(
+        active_opcode == 8, dcopy.error_code, dma.error_code
+    )
+    command_has_dma_error_code : bit = active_is_direct_dma |
+        (active_opcode == 8)
+    completion_error_value : u8 = mux(
+        command_failed & command_has_dma_error_code,
+        bitcast<u8>(64 | extend<8>(selected_error_code)),
+        0
+    )
+
+    fence_fault_any : bit = external_fence_fault | data_read_fence.fault |
+        data_write_fence.fault | command_read_fence.fault
+    fence_fault_write_value : bit = mux(
+        external_fence_fault, external_fence_fault_write,
+        mux(data_read_fence.fault, 0, mux(data_write_fence.fault, 1, 0))
+    )
+    fence_fault_master_value : u4 = mux(
+        external_fence_fault, external_fence_fault_master,
+        mux(data_read_fence.fault, 7,
+            mux(data_write_fence.fault, 8,
+                mux(command_read_fence.fault, 9, 0)))
+    )
+    fence_fault_addr_value : uint<64> = mux(
+        external_fence_fault, external_fence_fault_addr,
+        mux(data_read_fence.fault, data_read_fence.fault_addr,
+            mux(data_write_fence.fault, data_write_fence.fault_addr,
+                command_read_fence.fault_addr))
+    )
+    fence_fault_len_value : u8 = mux(
+        external_fence_fault, external_fence_fault_len,
+        mux(data_read_fence.fault, data_read_fence.fault_len,
+            mux(data_write_fence.fault, data_write_fence.fault_len,
+                command_read_fence.fault_len))
+    )
+    fence_fault_size_value : u3 = mux(
+        external_fence_fault, external_fence_fault_size,
+        mux(data_read_fence.fault, data_read_fence.fault_size,
+            mux(data_write_fence.fault, data_write_fence.fault_size,
+                command_read_fence.fault_size))
+    )
+    fence_fault_latch.fault = fence_fault_any
+    fence_fault_latch.fault_write = fence_fault_write_value
+    fence_fault_latch.fault_master = fence_fault_master_value
+    fence_fault_latch.fault_addr = fence_fault_addr_value
+    fence_fault_latch.fault_len = fence_fault_len_value
+    fence_fault_latch.fault_size = fence_fault_size_value
+    fence_fault_latch.clear_valid = dma_fence_fault_clear_valid
+    fence_fault_latch.clear_overflow = dma_fence_fault_clear_overflow
+    dma_fence_fault_valid = fence_fault_latch.valid
+    dma_fence_fault_overflow = fence_fault_latch.overflow
+    dma_fence_fault_write = fence_fault_latch.sticky_write
+    dma_fence_fault_master = fence_fault_latch.sticky_master
+    dma_fence_fault_addr = fence_fault_latch.sticky_addr
+    dma_fence_fault_len = fence_fault_latch.sticky_len
+    dma_fence_fault_size = fence_fault_latch.sticky_size
+
+    reg command_dma_error_previous : bit = 0
+    command_dma_error_previous <- command_dma.error
+    command_dma_error_pulse : bit = command_dma.error &
+        (~command_dma_error_previous)
+    perf.enable = perf_enable
+    perf.clear = perf_clear
+    perf.clear_error = perf_clear_error
+    perf.busy = engine_busy | external_busy
+    perf.command_start = dispatch
+    perf.dma_read = axi_read.ar.transfer |
+        (command_read_fence.down_ar_valid & command_axi_ar_ready) |
+        external_dma_read
+    perf.dma_write = axi_write.aw.transfer | external_dma_write
+    perf.error_event = command_failed | command_dma_error_pulse |
+        external_error_event
+    perf.error_code_in = mux(
+        command_failed, completion_error_value,
+        mux(command_dma_error_pulse,
+            bitcast<u8>(80 | extend<8>(command_dma.error_code)),
+            external_error_code)
+    )
+    perf_cycles = perf.cycles
+    perf_busy_cycles = perf.busy_cycles
+    perf_command_count = perf.command_count
+    perf_dma_read_count = perf.dma_read_count
+    perf_dma_write_count = perf.dma_write_count
+    perf_error_count = perf.error_count
+    perf_error_valid = perf.error_valid
+    perf_error_code = perf.error_code
+    command_queue.done_valid = command_done
+    command_queue.done_tag = active_tag
+
+    completion_queue.enable = completion_enable
+    completion_queue.clear = completion_clear
+    completion_queue.push_valid = command_done
+    completion_queue.push_tag = active_tag
+    completion_queue.push_opcode = active_opcode
+    completion_queue.push_status = mux(command_failed, 1, 0)
+    completion_queue.push_error = completion_error_value
+    completion_queue.pop = completion_pop
+
+    command_ready = command_queue.in_ready & command_supported_value
+    command_supported = command_supported_value
+    command_count = command_queue.count
+    last_done_tag = command_queue.last_done
+    debug_queue_output_valid = command_queue.out_valid
+    debug_queue_output_address = command_queue.out_addr
+    debug_queue_output_auxiliary = command_queue.out_aux
+    debug_queue_output_length = command_queue.out_length
+    debug_queue_output_opcode = command_queue.out_opcode
+    debug_queue_input_valid = host_command_selected | dma_command_selected
+    debug_queue_input_address = mux(
+        host_command_selected, command_address, command_dma.out_addr
+    )
+    debug_queue_input_auxiliary = mux(
+        host_command_selected, command_auxiliary, command_dma.out_aux
+    )
+    debug_queue_input_length = mux(
+        host_command_selected, command_length, command_dma.out_length
+    )
+    debug_queue_input_opcode = mux(
+        host_command_selected, command_opcode, command_dma.out_opcode
+    )
+    debug_queue_push_seen = command_queue.debug_push_seen
+    debug_queue_push_address = command_queue.debug_push_address
+    debug_queue_push_auxiliary = command_queue.debug_push_auxiliary
+    debug_queue_push_length = command_queue.debug_push_length
+    debug_queue_push_opcode = command_queue.debug_push_opcode
+    debug_queue_head_seen = command_queue.debug_head_seen
+    debug_queue_head_address = command_queue.debug_head_address
+    debug_queue_head_auxiliary = command_queue.debug_head_auxiliary
+    debug_queue_head_length = command_queue.debug_head_length
+    debug_queue_head_opcode = command_queue.debug_head_opcode
+    debug_queue_empty = command_queue.debug_empty
+    debug_queue_head_valid = command_queue.debug_head_valid
+    debug_queue_head_pointer = command_queue.debug_head_pointer
+    debug_queue_tail_pointer = command_queue.debug_tail_pointer
+    debug_queue_count = command_queue.debug_count
+    debug_ub_launch_pending = 0
+    debug_ub_capture_armed = queued_dma_start
+    debug_ub_capture_ok = queued_dma_start
+    debug_ub_capture = queued_dma_start
+    debug_ub_start = queued_dma_start
+    debug_ub_launch_dram_base = command_queue.out_addr
+    debug_ub_launch_ub_base = command_queue.out_aux
+    debug_ub_launch_length = command_queue.out_length
+    completion_valid = completion_queue.head_valid
+    completion_tag = completion_queue.head_tag
+    completion_opcode = completion_queue.head_opcode
+    completion_status = completion_queue.head_status
+    completion_error = completion_queue.head_error
+    completion_count = completion_queue.count
+    completion_overflow = completion_queue.overflow
+}

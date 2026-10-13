@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+fn descriptor_u64(low : u32, high : u32) -> bits<64> {
+    bitcast<bits<64>>(extend<64>(low) | (extend<64>(high) << 32))
+}
+
+enum ZtpuCommandDmaPhase { Idle Address Read Emit }
+
+// Fetches fixed 64-byte command descriptors and exposes one decoded command
+// at a time. The descriptor layout is fixed at 16 words.
+module ZtpuCommandDescriptorDma64x24 {
+    clock clk reset rst
+
+    in start, clear : bit
+    in base : uint<64>
+    in count : uint<24>
+    out busy : bit
+    out reg done : bit = 0
+    out reg error : bit = 0
+    out reg error_code : u4 = 0
+    out reg fetched_count : uint<24> = 0
+
+    out axi_ar_valid : bit
+    in axi_ar_ready : bit
+    out reg axi_ar_addr : uint<64> = 0
+    out axi_ar_len : u8
+    out axi_ar_size : u3
+    in axi_r_valid : bit
+    out axi_r_ready : bit
+    in axi_r_data : u32
+    in axi_r_last : bit
+    in axi_r_resp : bits<2>
+
+    out out_valid : bit
+    in out_ready : bit
+    out out_opcode : bits<4>
+    out out_addr, out_aux : bits<64>
+    out out_length : bits<16>
+    out out_tag, out_dep_tag : u8
+    out out_src1_base : bits<64>
+    out out_scalar0, out_scalar1, out_scalar2, out_scalar3 : bits<32>
+    out out_mxu_valid : bit
+    out out_mxu_a_base, out_mxu_b_base : bits<64>
+    out out_mxu_c_base, out_mxu_acc_base : bits<64>
+    out out_mxu_a_stride, out_mxu_b_stride, out_mxu_k_dim : bits<32>
+    out out_mxu_accum_en, out_mxu_acc_clear : bit
+    out out_mxu_spill_en, out_mxu_restore_en : bit
+    out out_mxu_rq_enable : bit
+    out out_mxu_rq_scale : bits<32>
+    out out_mxu_rq_shift : bits<8>
+    out out_mxu_rq_zero : bits<32>
+    out out_mxu_mode : bits<3>
+    out out_mxu_a_transpose, out_mxu_b_transpose : bit
+    out out_mxu_zs_enable_a, out_mxu_zs_enable_b : bit
+    out out_adam_valid, out_adam_clear : bit
+    out out_adam_m_base, out_adam_v_base : bits<64>
+    out out_adam_lr, out_adam_beta1 : bits<32>
+    out out_adam_beta2, out_adam_eps : bits<32>
+
+    reg descriptor_words : vec<16,u32> = generate(i in 0..16) 0
+    reg remaining : uint<24> = 0
+    reg word_index : u4 = 0
+
+    idle : bit = phase == ZtpuCommandDmaPhase.Idle
+    address_state : bit = phase == ZtpuCommandDmaPhase.Address
+    read_state : bit = phase == ZtpuCommandDmaPhase.Read
+    emit_state : bit = phase == ZtpuCommandDmaPhase.Emit
+    base_bits : bits<64> = bitcast<bits<64>>(base)
+    aligned : bit = base_bits[5:0] == 0
+    legal_start : bit = idle & start & (count != 0) & aligned
+    empty_start : bit = idle & start & (count == 0)
+    bad_start : bit = idle & start & (count != 0) & (~aligned)
+    address_fire : bit = address_state & axi_ar_ready
+    read_fire : bit = read_state & axi_r_valid
+    expected_last : bit = word_index == 15
+    response_error : bit = read_fire & (axi_r_resp != 0)
+    last_error : bit = read_fire & (axi_r_resp == 0) &
+        (axi_r_last != expected_last)
+    accepted_word : bit = read_fire & (axi_r_resp == 0) & (~last_error)
+    emit_fire : bit = emit_state & out_ready
+    final_descriptor : bit = remaining == 1
+
+    axi_ar_addr <- mux(
+        legal_start,
+        base,
+        mux(emit_fire & (~final_descriptor),
+            truncate<64>(axi_ar_addr + 64), axi_ar_addr)
+    )
+    remaining <- mux(
+        legal_start,
+        count,
+        mux(emit_fire,
+            mux(final_descriptor, 0, remaining - 1), remaining)
+    )
+    word_index <- mux(
+        address_fire,
+        0,
+        mux(accepted_word & (~expected_last),
+            truncate<4>(word_index + 1), word_index)
+    )
+    when accepted_word {
+        descriptor_words[word_index] <- axi_r_data
+    }
+
+    done <- mux(
+        idle & start,
+        empty_start,
+        mux(emit_fire & final_descriptor, 1, mux(clear, 0, done))
+    )
+    error <- mux(
+        idle & start,
+        bad_start,
+        mux(response_error | last_error, 1, mux(clear, 0, error))
+    )
+    error_code <- mux(
+        idle & start,
+        mux(bad_start, 1, 0),
+        mux(response_error, 2,
+            mux(last_error, 3, mux(clear, 0, error_code)))
+    )
+    fetched_count <- mux(
+        idle & start,
+        0,
+        mux(emit_fire,
+            truncate<24>(fetched_count + 1), fetched_count)
+    )
+
+    header : u32 = descriptor_words[0]
+    mxu_control : u32 = descriptor_words[13]
+    adam_control : u32 = descriptor_words[14]
+    header_bits : bits<32> = bitcast<bits<32>>(header)
+    length_bits : bits<32> = bitcast<bits<32>>(descriptor_words[1])
+    mxu_control_bits : bits<32> = bitcast<bits<32>>(mxu_control)
+    adam_control_bits : bits<32> = bitcast<bits<32>>(adam_control)
+    is_mxu : bit = bitcast<u4>(header_bits[3:0]) == 5
+    is_adam : bit = bitcast<u4>(header_bits[3:0]) == 6
+
+    busy = ~idle
+    axi_ar_valid = address_state
+    axi_ar_len = 15
+    axi_ar_size = 2
+    axi_r_ready = read_state
+
+    out_valid = emit_state
+    out_opcode = header_bits[3:0]
+    out_tag = bitcast<u8>(header_bits[15:8])
+    out_dep_tag = bitcast<u8>(header_bits[23:16])
+    out_length = length_bits[15:0]
+    out_addr = descriptor_u64(descriptor_words[2], descriptor_words[3])
+    out_aux = descriptor_u64(descriptor_words[4], descriptor_words[5])
+    out_src1_base = descriptor_u64(descriptor_words[6], descriptor_words[7])
+    out_scalar0 = bitcast<bits<32>>(descriptor_words[8])
+    out_scalar1 = bitcast<bits<32>>(descriptor_words[9])
+    out_scalar2 = bitcast<bits<32>>(descriptor_words[10])
+    out_scalar3 = bitcast<bits<32>>(descriptor_words[11])
+
+    out_mxu_valid = is_mxu & mxu_control_bits[0]
+    out_mxu_a_base = descriptor_u64(descriptor_words[2], descriptor_words[3])
+    out_mxu_b_base = descriptor_u64(descriptor_words[4], descriptor_words[5])
+    out_mxu_c_base = descriptor_u64(descriptor_words[6], descriptor_words[7])
+    out_mxu_acc_base = descriptor_u64(descriptor_words[8], descriptor_words[9])
+    out_mxu_a_stride = bitcast<bits<32>>(descriptor_words[10])
+    out_mxu_b_stride = bitcast<bits<32>>(descriptor_words[11])
+    out_mxu_k_dim = bitcast<bits<32>>(descriptor_words[12])
+    out_mxu_accum_en = is_mxu & mxu_control_bits[1]
+    out_mxu_acc_clear = is_mxu & mxu_control_bits[2]
+    out_mxu_spill_en = is_mxu & mxu_control_bits[3]
+    out_mxu_restore_en = is_mxu & mxu_control_bits[4]
+    out_mxu_rq_enable = is_mxu & mxu_control_bits[5]
+    out_mxu_rq_shift = mxu_control_bits[13:6]
+    out_mxu_mode = mxu_control_bits[16:14]
+    out_mxu_a_transpose = is_mxu & mxu_control_bits[17]
+    out_mxu_b_transpose = is_mxu & mxu_control_bits[18]
+    out_mxu_zs_enable_a = is_mxu & mxu_control_bits[19]
+    out_mxu_zs_enable_b = is_mxu & mxu_control_bits[20]
+    out_mxu_rq_scale = bitcast<bits<32>>(descriptor_words[14])
+    out_mxu_rq_zero = bitcast<bits<32>>(descriptor_words[15])
+
+    out_adam_valid = is_adam & adam_control_bits[0]
+    out_adam_clear = is_adam & adam_control_bits[1]
+    out_adam_m_base = descriptor_u64(descriptor_words[6], descriptor_words[7])
+    out_adam_v_base = descriptor_u64(descriptor_words[8], descriptor_words[9])
+    out_adam_lr = bitcast<bits<32>>(descriptor_words[10])
+    out_adam_beta1 = bitcast<bits<32>>(descriptor_words[11])
+    out_adam_beta2 = bitcast<bits<32>>(descriptor_words[12])
+    out_adam_eps = bitcast<bits<32>>(descriptor_words[13])
+
+    fsm phase : ZtpuCommandDmaPhase = Idle {
+        Idle { when legal_start -> Address {} }
+        Address { when address_fire -> Read {} }
+        Read {
+            priority {
+                when response_error | last_error -> Idle {}
+                when accepted_word & expected_last -> Emit {}
+            }
+        }
+        Emit {
+            priority {
+                when emit_fire & final_descriptor -> Idle {}
+                when emit_fire -> Address {}
+            }
+        }
+    }
+}

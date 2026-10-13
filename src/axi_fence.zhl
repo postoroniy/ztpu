@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import std.bus.axi_burst
+
+fn ztpu_fence_max3(a : u64, b : u64, c : u64) -> u64 {
+    mux(a > b, mux(a > c, a, c), mux(b > c, b, c))
+}
+
+fn ztpu_fence_min3(a : u64, b : u64, c : u64) -> u64 {
+    mux(a < b, mux(a < c, a, c), mux(b < c, b, c))
+}
+
+// Single-outstanding AXI read fence for the 64-bit/32-bit ZTPU masters.
+module ZtpuAxiReadFence64x32 {
+    clock clk reset rst
+
+    in enable : bit
+    in base, limit : uint<64>
+    out fault : bit
+    out fault_addr : uint<64>
+    out fault_len : u8
+    out fault_size : u3
+
+    in up_ar_valid : bit
+    out up_ar_ready : bit
+    in up_ar_addr : uint<64>
+    in up_ar_len : u8
+    in up_ar_size : u3
+    out up_r_valid : bit
+    in up_r_ready : bit
+    out up_r_data : bits<32>
+    out up_r_last : bit
+    out up_r_resp : bits<2>
+
+    out down_ar_valid : bit
+    in down_ar_ready : bit
+    out down_ar_addr : uint<64>
+    out down_ar_len : u8
+    out down_ar_size : u3
+    in down_r_valid : bit
+    out down_r_ready : bit
+    in down_r_data : bits<32>
+    in down_r_last : bit
+    in down_r_resp : bits<2>
+
+    reg blocked_active : bit = 0
+    reg blocked_beats_left : u9 = 0
+
+    burst_beats : u9 = truncate<9>(extend<9>(up_ar_len) + 1)
+    burst_bytes : uint<74> = extend<74>(burst_beats) << up_ar_size
+    end_address : uint<74> = truncate<74>(
+        extend<74>(up_ar_addr) + burst_bytes
+    )
+    range_ok : bit = (up_ar_addr >= base) & (up_ar_addr < limit) &
+        (end_address <= extend<74>(limit))
+    block_request : bit = enable & (~range_ok)
+    up_ar_ready_value : bit = mux(
+        block_request,
+        ~blocked_active,
+        down_ar_ready & (~blocked_active)
+    )
+    accept_blocked : bit = up_ar_valid & up_ar_ready_value & block_request
+    blocked_response_valid : bit = block_request & blocked_active
+    accept_blocked_response : bit = blocked_active & blocked_response_valid &
+        up_r_ready
+
+    blocked_active <- mux(
+        accept_blocked,
+        1,
+        mux(accept_blocked_response & (blocked_beats_left == 1),
+            0, blocked_active)
+    )
+    blocked_beats_left <- mux(
+        accept_blocked,
+        truncate<9>(extend<9>(up_ar_len) + 1),
+        mux(accept_blocked_response,
+            mux(blocked_beats_left == 1, 0, blocked_beats_left - 1),
+            blocked_beats_left)
+    )
+
+    down_ar_valid = up_ar_valid & (~blocked_active) & (~block_request)
+    down_ar_addr = up_ar_addr
+    down_ar_len = up_ar_len
+    down_ar_size = up_ar_size
+    down_r_ready = up_r_ready
+    up_ar_ready = up_ar_ready_value
+    up_r_valid = mux(blocked_response_valid, 1, down_r_valid)
+    up_r_data = mux(blocked_response_valid, 0, down_r_data)
+    up_r_last = mux(
+        blocked_response_valid, blocked_beats_left == 1, down_r_last
+    )
+    up_r_resp = mux(blocked_response_valid, 2, down_r_resp)
+
+    fault = accept_blocked
+    fault_addr = up_ar_addr
+    fault_len = up_ar_len
+    fault_size = up_ar_size
+
+    assert rejected_read_not_forwarded @ clk {
+        (~block_request) | (~down_ar_valid)
+    }
+    assert blocked_read_not_forwarded @ clk {
+        (~blocked_active) | (~down_ar_valid)
+    }
+    assert read_fault_is_enabled_rejection @ clk {
+        (~fault) | (enable & (~range_ok))
+    }
+    assert blocked_read_returns_error @ clk {
+        (~blocked_response_valid) |
+            (up_r_valid & (up_r_resp == 2) & (~down_ar_valid))
+    }
+    cover rejects_read @ clk { fault }
+}
+
+// Single-outstanding AXI write fence for the 64-bit/32-bit ZTPU masters.
+module ZtpuAxiWriteFence64x32 {
+    clock clk reset rst
+
+    in enable : bit
+    in base, limit : uint<64>
+    out fault : bit
+    out fault_addr : uint<64>
+    out fault_len : u8
+    out fault_size : u3
+
+    in up_aw_valid : bit
+    out up_aw_ready : bit
+    in up_aw_addr : uint<64>
+    in up_aw_len : u8
+    in up_aw_size : u3
+    in up_w_valid : bit
+    out up_w_ready : bit
+    in up_w_data : bits<32>
+    in up_w_last : bit
+    out up_b_valid : bit
+    in up_b_ready : bit
+    out up_b_resp : bits<2>
+
+    out down_aw_valid : bit
+    in down_aw_ready : bit
+    out down_aw_addr : uint<64>
+    out down_aw_len : u8
+    out down_aw_size : u3
+    out down_w_valid : bit
+    in down_w_ready : bit
+    out down_w_data : bits<32>
+    out down_w_last : bit
+    in down_b_valid : bit
+    out down_b_ready : bit
+    in down_b_resp : bits<2>
+
+    reg blocked_active : bit = 0
+    reg blocked_beats_left : u9 = 0
+    reg blocked_response_pending : bit = 0
+
+    burst_beats : u9 = truncate<9>(extend<9>(up_aw_len) + 1)
+    burst_bytes : uint<74> = extend<74>(burst_beats) << up_aw_size
+    end_address : uint<74> = truncate<74>(
+        extend<74>(up_aw_addr) + burst_bytes
+    )
+    range_ok : bit = (up_aw_addr >= base) & (up_aw_addr < limit) &
+        (end_address <= extend<74>(limit))
+    block_request : bit = enable & (~range_ok)
+    up_aw_ready_value : bit = mux(
+        block_request,
+        (~blocked_active) & (~blocked_response_pending),
+        down_aw_ready & (~blocked_active) & (~blocked_response_pending)
+    )
+    up_w_ready_value : bit = mux(
+        blocked_active,
+        1,
+        down_w_ready & (~blocked_response_pending)
+    )
+    accept_blocked : bit = up_aw_valid & up_aw_ready_value & block_request
+    accept_blocked_word : bit = blocked_active & up_w_valid & up_w_ready_value
+    final_blocked_word : bit = blocked_beats_left == 1
+    accept_blocked_response : bit = blocked_response_pending & up_b_ready
+
+    blocked_active <- mux(
+        accept_blocked,
+        1,
+        mux(accept_blocked_word & final_blocked_word, 0, blocked_active)
+    )
+    blocked_beats_left <- mux(
+        accept_blocked,
+        truncate<9>(extend<9>(up_aw_len) + 1),
+        mux(accept_blocked_word,
+            mux(final_blocked_word, 0, blocked_beats_left - 1),
+            blocked_beats_left)
+    )
+    blocked_response_pending <- mux(
+        accept_blocked_word & final_blocked_word,
+        1,
+        mux(accept_blocked_response, 0, blocked_response_pending)
+    )
+
+    down_aw_valid = up_aw_valid & (~blocked_active) &
+        (~blocked_response_pending) & (~block_request)
+    down_aw_addr = up_aw_addr
+    down_aw_len = up_aw_len
+    down_aw_size = up_aw_size
+    down_w_valid = up_w_valid & (~blocked_active) &
+        (~blocked_response_pending)
+    down_w_data = up_w_data
+    down_w_last = up_w_last
+    down_b_ready = mux(blocked_response_pending, 0, up_b_ready)
+
+    up_aw_ready = up_aw_ready_value
+    up_w_ready = up_w_ready_value
+    up_b_valid = mux(blocked_response_pending, 1, down_b_valid)
+    up_b_resp = mux(blocked_response_pending, 2, down_b_resp)
+
+    fault = accept_blocked
+    fault_addr = up_aw_addr
+    fault_len = up_aw_len
+    fault_size = up_aw_size
+
+    assert rejected_write_not_forwarded @ clk {
+        (~block_request) | (~down_aw_valid)
+    }
+    assert blocked_write_address_not_forwarded @ clk {
+        (~blocked_active) | (~down_aw_valid)
+    }
+    assert write_fault_is_enabled_rejection @ clk {
+        (~fault) | (enable & (~range_ok))
+    }
+    assert blocked_write_returns_error @ clk {
+        (~blocked_response_pending) |
+            (up_b_valid & (up_b_resp == 2) & (~down_aw_valid) &
+                (~down_w_valid))
+    }
+    cover rejects_write @ clk { fault }
+}
+
+// Typed adapters connect the flat protocol modules to the top-level hierarchy.
+module ZtpuAxiReadFencePort64x32 {
+    clock clk reset rst
+    in enable : bit
+    in base, limit : uint<64>
+    out fault : bit
+    out fault_addr : uint<64>
+    out fault_len : u8
+    out fault_size : u3
+    out transfer : bit
+    interface up : AXI4BurstReadSubset<64,32>.slave @clk
+    interface down : AXI4BurstReadSubset<64,32>.master @clk
+
+    inst core : ZtpuAxiReadFence64x32 {
+        enable base limit
+        up_ar_valid = up.ar.valid
+        up_ar_addr = up.ar.payload.addr
+        up_ar_len = up.ar.payload.len
+        up_ar_size = up.ar.payload.size
+        up_r_ready = up.r.ready
+        down_ar_ready = down.ar.ready
+        down_r_valid = down.r.valid
+        down_r_data = down.r.payload.data
+        down_r_last = down.r.payload.last
+        down_r_resp = down.r.payload.resp
+    }
+    fault = core.fault
+    fault_addr = core.fault_addr
+    fault_len = core.fault_len
+    fault_size = core.fault_size
+    up.ar.ready = core.up_ar_ready
+    up.r.valid = core.up_r_valid
+    up.r.payload = AxiBurstReadData {
+        data = core.up_r_data last = core.up_r_last resp = core.up_r_resp
+    }
+    down.ar.valid = core.down_ar_valid
+    down.ar.payload = AxiBurstAddress {
+        addr = core.down_ar_addr len = core.down_ar_len size = core.down_ar_size
+    }
+    down.r.ready = core.down_r_ready
+    transfer = core.down_ar_valid & down.ar.ready
+}
+
+module ZtpuAxiWriteFencePort64x32 {
+    clock clk reset rst
+    in enable : bit
+    in base, limit : uint<64>
+    out fault : bit
+    out fault_addr : uint<64>
+    out fault_len : u8
+    out fault_size : u3
+    out transfer : bit
+    interface up : AXI4BurstWriteSubset<64,32>.slave @clk
+    interface down : AXI4BurstWriteSubset<64,32>.master @clk
+
+    inst core : ZtpuAxiWriteFence64x32 {
+        enable base limit
+        up_aw_valid = up.aw.valid
+        up_aw_addr = up.aw.payload.addr
+        up_aw_len = up.aw.payload.len
+        up_aw_size = up.aw.payload.size
+        up_w_valid = up.w.valid
+        up_w_data = up.w.payload.data
+        up_w_last = up.w.payload.last
+        up_b_ready = up.b.ready
+        down_aw_ready = down.aw.ready
+        down_w_ready = down.w.ready
+        down_b_valid = down.b.valid
+        down_b_resp = down.b.payload.resp
+    }
+    fault = core.fault
+    fault_addr = core.fault_addr
+    fault_len = core.fault_len
+    fault_size = core.fault_size
+    up.aw.ready = core.up_aw_ready
+    up.w.ready = core.up_w_ready
+    up.b.valid = core.up_b_valid
+    up.b.payload = AxiBurstWriteResponse { resp = core.up_b_resp }
+    down.aw.valid = core.down_aw_valid
+    down.aw.payload = AxiBurstAddress {
+        addr = core.down_aw_addr len = core.down_aw_len size = core.down_aw_size
+    }
+    down.w.valid = core.down_w_valid
+    down.w.payload = AxiBurstWriteData {
+        data = core.down_w_data last = core.down_w_last
+    }
+    down.b.ready = core.down_b_ready
+    transfer = core.down_aw_valid & down.aw.ready
+}

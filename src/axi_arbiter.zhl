@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import std.bus.axi_burst
+
+// Two-master, single-outstanding read arbiter. Master 0 has fixed priority at
+// an idle boundary; the grant remains owned through the accepted RLAST beat.
+module ZtpuAxiReadArbiter2x64x32 {
+    clock clk reset rst
+
+    interface m0 : AXI4BurstReadSubset<64,32>.slave @clk
+    interface m1 : AXI4BurstReadSubset<64,32>.slave @clk
+    interface s : AXI4BurstReadSubset<64,32>.master @clk
+
+    reg owner : u2 = 0
+    select_m0 : bit = owner == 1
+    select_m1 : bit = owner == 2
+    idle_select_m0 : bit = (owner == 0) & m0.ar.valid
+    idle_select_m1 : bit = (owner == 0) & (~m0.ar.valid) & m1.ar.valid
+    accept_m0 : bit = idle_select_m0 & s.ar.ready
+    accept_m1 : bit = idle_select_m1 & s.ar.ready
+    selected_r_ready : bit = mux(
+        select_m0, m0.r.ready, mux(select_m1, m1.r.ready, 0)
+    )
+    finish : bit = s.r.valid & selected_r_ready & s.r.payload.last
+
+    priority {
+        when finish { owner <- 0 }
+        when accept_m0 { owner <- 1 }
+        when accept_m1 { owner <- 2 }
+    }
+
+    s.ar.valid = idle_select_m0 | idle_select_m1
+    s.ar.payload = mux(idle_select_m0, m0.ar.payload, m1.ar.payload)
+    m0.ar.ready = idle_select_m0 & s.ar.ready
+    m1.ar.ready = idle_select_m1 & s.ar.ready
+
+    m0.r.valid = select_m0 & s.r.valid
+    m1.r.valid = select_m1 & s.r.valid
+    m0.r.payload = s.r.payload
+    m1.r.payload = s.r.payload
+    s.r.ready = selected_r_ready
+}
+
+// AW chooses the owner and W/B remain routed to that owner until B transfer.
+module ZtpuAxiWriteArbiter2x64x32 {
+    clock clk reset rst
+
+    interface m0 : AXI4BurstWriteSubset<64,32>.slave @clk
+    interface m1 : AXI4BurstWriteSubset<64,32>.slave @clk
+    interface s : AXI4BurstWriteSubset<64,32>.master @clk
+
+    reg owner : u2 = 0
+    idle_select_m0 : bit = (owner == 0) & m0.aw.valid
+    idle_select_m1 : bit = (owner == 0) & (~m0.aw.valid) & m1.aw.valid
+    accept_m0 : bit = idle_select_m0 & s.aw.ready
+    accept_m1 : bit = idle_select_m1 & s.aw.ready
+    active_m0 : bit = (owner == 1) | accept_m0
+    active_m1 : bit = (owner == 2) | accept_m1
+    selected_b_ready : bit = mux(
+        owner == 1, m0.b.ready, mux(owner == 2, m1.b.ready, 0)
+    )
+    finish : bit = s.b.valid & selected_b_ready
+
+    priority {
+        when finish { owner <- 0 }
+        when accept_m0 { owner <- 1 }
+        when accept_m1 { owner <- 2 }
+    }
+
+    s.aw.valid = idle_select_m0 | idle_select_m1
+    s.aw.payload = mux(idle_select_m0, m0.aw.payload, m1.aw.payload)
+    m0.aw.ready = idle_select_m0 & s.aw.ready
+    m1.aw.ready = idle_select_m1 & s.aw.ready
+
+    s.w.valid = mux(active_m0, m0.w.valid, mux(active_m1, m1.w.valid, 0))
+    s.w.payload = mux(active_m0, m0.w.payload, m1.w.payload)
+    m0.w.ready = active_m0 & s.w.ready
+    m1.w.ready = active_m1 & s.w.ready
+    m0.b.valid = (owner == 1) & s.b.valid
+    m1.b.valid = (owner == 2) & s.b.valid
+    m0.b.payload = s.b.payload
+    m1.b.payload = s.b.payload
+    s.b.ready = selected_b_ready
+}
