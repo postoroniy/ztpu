@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+enum ZtpuUbStreamReaderPhase { Idle Run TransposeFetch TransposeEmit Done }
+enum ZtpuUbStreamWriterPhase { Idle Run Done }
+
+// Fixed 32-bit/64-bit-address reader matching the current ZTPU queued engines.
+module ZtpuUbStreamReader32 {
+    clock clk reset rst
+
+    in start : bit
+    in base : uint<64>
+    in count : u16
+    in stride_bytes : uint<64>
+    in transpose_enable : bit
+    in row_count : u3
+    out busy, done : bit
+
+    out ub_read_valid : bit
+    in ub_read_ready : bit
+    out ub_read_addr : uint<64>
+    in ub_read_data : bits<32>
+
+    out source_valid : bit
+    in source_ready : bit
+    out source_data : bits<32>
+
+    reg address : uint<64> = 0
+    reg words_left : u16 = 0
+    reg transpose_k : u16 = 0
+    reg transpose_row : u3 = 0
+    reg transpose_row_addr : uint<64> = 0
+    reg packed_bytes : vec<4,bits<8>> = generate(i in 0..4) 0
+
+    idle : bit = phase == ZtpuUbStreamReaderPhase.Idle
+    run : bit = phase == ZtpuUbStreamReaderPhase.Run
+    transpose_fetch : bit = phase == ZtpuUbStreamReaderPhase.TransposeFetch
+    transpose_emit : bit = phase == ZtpuUbStreamReaderPhase.TransposeEmit
+    done_state : bit = phase == ZtpuUbStreamReaderPhase.Done
+
+    stride_effective : uint<64> = mux(stride_bytes == 0, 4, stride_bytes)
+    row_count_effective : u3 = mux(row_count == 0, 4, mux(row_count > 4, 4, row_count))
+    byte_select : u2 = truncate<2>(transpose_k)
+    selected_byte : bits<8> = mux(
+        byte_select == 0,
+        ub_read_data[7:0],
+        mux(byte_select == 1, ub_read_data[15:8],
+            mux(byte_select == 2, ub_read_data[23:16], ub_read_data[31:24]))
+    )
+    next_k : u16 = truncate<16>(transpose_k + 1)
+    next_word_offset : u16 = truncate<16>(next_k >> 2)
+    next_word_offset_bytes : uint<64> = extend<64>(next_word_offset) << 2
+
+    ub_read_valid_value = mux(
+        run,
+        words_left != 0,
+        mux(transpose_fetch, words_left != 0, 0)
+    )
+    source_valid_value = mux(
+        run,
+        (words_left != 0) & ub_read_ready,
+        mux(transpose_emit, words_left != 0, 0)
+    )
+    source_fire : bit = source_valid_value & source_ready
+    fetch_fire : bit = ub_read_valid_value & ub_read_ready
+    row_complete : bit = truncate<3>(transpose_row + 1) >= row_count_effective
+
+    address <- mux(idle & start, base,
+        mux(run & source_fire, truncate<64>(address + stride_effective), address))
+    words_left <- mux(idle & start, count,
+        mux(run & source_fire, words_left - 1,
+            mux(transpose_emit & source_fire, words_left - 1, words_left)))
+    transpose_k <- mux(idle & start, 0,
+        mux(transpose_emit & source_fire, next_k, transpose_k))
+    transpose_row <- mux(idle & start, 0,
+        mux(transpose_emit & source_fire, 0,
+            mux(fetch_fire & (~row_complete), truncate<3>(transpose_row + 1),
+                transpose_row)))
+    transpose_row_addr <- mux(idle & start, base,
+        mux(transpose_emit & source_fire, truncate<64>(base + next_word_offset_bytes),
+            mux(fetch_fire & (~row_complete),
+                truncate<64>(transpose_row_addr + stride_effective), transpose_row_addr)))
+
+    priority {
+        when (idle & start) | (transpose_emit & source_fire) {
+            packed_bytes <- generate(i in 0..4) 0
+        }
+        when fetch_fire {
+            packed_bytes[truncate<2>(transpose_row)] <- selected_byte
+        }
+    }
+
+    busy = run | transpose_fetch | transpose_emit
+    done = done_state
+    ub_read_valid = ub_read_valid_value
+    ub_read_addr = mux(transpose_fetch, transpose_row_addr, address)
+    source_valid = source_valid_value
+    source_data = mux(
+        transpose_emit,
+        bitcast<bits<32>>(packed_bytes),
+        ub_read_data
+    )
+
+    fsm phase : ZtpuUbStreamReaderPhase = Idle {
+        Idle {
+            priority {
+                when start & (count == 0) -> Done {}
+                when start & transpose_enable -> TransposeFetch {}
+                when start -> Run {}
+            }
+        }
+        Run { when words_left == 0 -> Done {} }
+        TransposeFetch {
+            priority {
+                when words_left == 0 -> Done {}
+                when fetch_fire & row_complete -> TransposeEmit {}
+            }
+        }
+        TransposeEmit {
+            priority {
+                when words_left == 0 -> Done {}
+                when source_fire & (words_left == 1) -> Done {}
+                when source_fire -> TransposeFetch {}
+            }
+        }
+        Done { -> Idle {} }
+    }
+}
+
+module ZtpuUbStreamWriter32 {
+    clock clk reset rst
+
+    in start : bit
+    in base : uint<64>
+    in count : u16
+    out busy, done : bit
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    in sink_valid : bit
+    out sink_ready : bit
+    in sink_data : bits<32>
+
+    reg address : uint<64> = 0
+    reg words_left : u16 = 0
+
+    idle : bit = phase == ZtpuUbStreamWriterPhase.Idle
+    run : bit = phase == ZtpuUbStreamWriterPhase.Run
+    done_state : bit = phase == ZtpuUbStreamWriterPhase.Done
+    ub_write_valid_value = run & (words_left != 0) & sink_valid
+    fire : bit = ub_write_valid_value & ub_write_ready
+
+    address <- mux(idle & start, base,
+        mux(run & fire, truncate<64>(address + 4), address))
+    words_left <- mux(idle & start, count,
+        mux(run & fire, words_left - 1, words_left))
+
+    busy = run
+    done = done_state
+    ub_write_valid = ub_write_valid_value
+    ub_write_addr = address
+    ub_write_data = sink_data
+    ub_write_mask = 15
+    sink_ready = run & (words_left != 0) & ub_write_ready
+
+    fsm phase : ZtpuUbStreamWriterPhase = Idle {
+        Idle { when start -> Run {} }
+        Run { when words_left == 0 -> Done {} }
+        Done { -> Idle {} }
+    }
+}

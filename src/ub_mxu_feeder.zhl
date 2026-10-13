@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+enum ZtpuUbMxuFeederPhase { Idle Run Done }
+
+fn ztpu_ub_unpack_i8x4(word : bits<32>) -> vec<4,s32> {
+    generate(i in 0..4)
+        extend<32>(bitcast<s8>(bitcast<vec<4,bits<8>>>(word)[i]))
+}
+
+module ZtpuUbMxuFeeder4x4I8 {
+    clock clk reset rst
+
+    in start : bit
+    in a_base : uint<64>
+    in b_base : uint<64>
+    in k_dim : u16
+    out busy, done, clear_pulse, stream_valid : bit
+    out a0, a1, a2, a3 : s32
+    out b0, b1, b2, b3 : s32
+
+    out ub_a_valid : bit
+    in ub_a_ready : bit
+    out ub_a_addr : uint<64>
+    in ub_a_data : bits<32>
+
+    out ub_b_valid : bit
+    in ub_b_ready : bit
+    out ub_b_addr : uint<64>
+    in ub_b_data : bits<32>
+
+    reg index : u16 = 0
+    reg a_address : uint<64> = 0
+    reg b_address : uint<64> = 0
+
+    idle : bit = phase == ZtpuUbMxuFeederPhase.Idle
+    run : bit = phase == ZtpuUbMxuFeederPhase.Run
+    done_state : bit = phase == ZtpuUbMxuFeederPhase.Done
+    k_done : bit = index == k_dim
+    can_fire : bit = ub_a_ready & ub_b_ready
+    fire : bit = run & (~k_done) & can_fire
+
+    index <- mux(idle & start, 0,
+        mux(fire, truncate<16>(index + 1), index))
+    a_address <- mux(idle & start, a_base,
+        mux(fire, truncate<64>(a_address + 4), a_address))
+    b_address <- mux(idle & start, b_base,
+        mux(fire, truncate<64>(b_address + 4), b_address))
+
+    busy = run
+    done = done_state
+    clear_pulse = idle & start
+    stream_valid = fire
+    ub_a_valid = run
+    ub_a_addr = a_address
+    ub_b_valid = run
+    ub_b_addr = b_address
+
+    unpacked_a : vec<4,s32> = ztpu_ub_unpack_i8x4(ub_a_data)
+    unpacked_b : vec<4,s32> = ztpu_ub_unpack_i8x4(ub_b_data)
+    active_a : vec<4,s32> = generate(i in 0..4) mux(fire, unpacked_a[i], 0)
+    active_b : vec<4,s32> = generate(i in 0..4) mux(fire, unpacked_b[i], 0)
+    a0 = active_a[0]
+    a1 = active_a[1]
+    a2 = active_a[2]
+    a3 = active_a[3]
+    b0 = active_b[0]
+    b1 = active_b[1]
+    b2 = active_b[2]
+    b3 = active_b[3]
+
+    fsm phase : ZtpuUbMxuFeederPhase = Idle {
+        Idle { when start -> Run {} }
+        Run { when k_done -> Done {} }
+        Done { -> Idle {} }
+    }
+}

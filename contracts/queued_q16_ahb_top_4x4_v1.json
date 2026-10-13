@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "contract": "ztpu_queued_q16_ahb_top_4x4_v1",
+  "source_language": "zlang",
+  "integration_top": "ZtpuQueuedQ16AhbTop4x4",
+  "base_contract": "queued_q16_ahb_top_v1.json",
+  "unified_buffer_depth_words": 1024,
+  "compute": {
+    "mode": "exact_q16_scalar_matmul",
+    "tile_rows": 4,
+    "tile_cols": 4,
+    "accumulator_words": 16,
+    "k_dimension": "runtime_u16",
+    "transpose": "independent_a_and_b_addressed_gather",
+    "accumulation": "clear_accumulate_spill_restore"
+  },
+  "native_i8_compute": {
+    "modes": [0, 1, 2],
+    "tile_rows": 4,
+    "tile_cols": 4,
+    "packed_lanes": 4,
+    "requantization": "descriptor_controlled_q32_writeback",
+    "selection": "queued_descriptor_mxu_mode"
+  },
+  "compatibility": {
+    "descriptor_format": "unchanged_64_byte_union",
+    "ahb_register_map": "unchanged",
+    "microgpt_profile": "remains_ZtpuQueuedQ16AhbTop_2x2"
+  },
+  "excluded": [
+    "asic_backend",
+    "synthesis_and_physical_flow"
+  ],
+  "verification": {
+    "compute": "direct_matrix_spill_restore_tests",
+    "queued_top": "bounded_four_descriptor_ahb_dma_replay_16_exact_outputs",
+    "tinycar": "8596_descriptor_full_inference_replay_384_exact_head_words",
+    "native_q8": "four_descriptor_linear_tile_plus_3010_descriptor_hybrid_q8_microgpt_replay"
+  }
+}

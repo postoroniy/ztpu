@@ -1,0 +1,10 @@
+{"reset":{"rst":true},"set":{"start":0,"base_addr":128,"row_stride":32,"col_stride":4,"rows":2,"cols":3,"stream_ready":0},"edges":["clk"]}
+{"reset":{"rst":false}}
+{"set":{"start":1},"edges":["clk"]}
+{"set":{"start":0},"edges":["clk"]}
+{"set":{"stream_ready":1},"edges":["clk"]}
+{"edges":["clk"]}
+{"set":{"stream_ready":0},"edges":["clk"]}
+{"set":{"stream_ready":1},"edges":["clk"]}
+{"edges":["clk"]}
+{"edges":["clk"]}

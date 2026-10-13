@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+enum ZtpuUbDcopyPhase { Idle LoadStart LoadWait StoreStart StoreWait Done }
+
+// Strided DRAM-to-DRAM copy controller for the existing UB DMA engine.
+// Each row is loaded into one UB window and then stored to its destination.
+module ZtpuUbDcopy64x32 {
+    clock clk reset rst
+
+    in start : bit
+    in source_base, destination_base, ub_base : uint<64>
+    in row_bytes : u16
+    in row_count : u32
+    in source_stride, destination_stride : uint<64>
+    out busy, done : bit
+    out reg error : bit = 0
+    out reg error_code : u8 = 0
+
+    in dma_busy, dma_done, dma_error : bit
+    in dma_error_code : u8
+    out dma_start, dma_direction : bit
+    out dma_dram_base : uint<64>
+    out reg dma_ub_base : uint<64> = 0
+    out reg dma_length_bytes : u16 = 0
+
+    reg source_address : uint<64> = 0
+    reg destination_address : uint<64> = 0
+    reg source_row_stride : uint<64> = 0
+    reg destination_row_stride : uint<64> = 0
+    reg rows_left : u32 = 0
+
+    idle : bit = phase == ZtpuUbDcopyPhase.Idle
+    load_start_state : bit = phase == ZtpuUbDcopyPhase.LoadStart
+    load_wait_state : bit = phase == ZtpuUbDcopyPhase.LoadWait
+    store_start_state : bit = phase == ZtpuUbDcopyPhase.StoreStart
+    store_wait_state : bit = phase == ZtpuUbDcopyPhase.StoreWait
+    done_state : bit = phase == ZtpuUbDcopyPhase.Done
+
+    start_accepted : bit = idle & start
+    empty_copy : bit = (row_count == 0) | (row_bytes == 0)
+    launch_dma : bit = (load_start_state | store_start_state) & (~dma_busy)
+    load_finished : bit = load_wait_state & dma_done
+    store_finished : bit = store_wait_state & dma_done
+    transfer_failed : bit = (load_finished | store_finished) & dma_error
+    last_row : bit = rows_left <= 1
+    advance_row : bit = store_finished & (~dma_error) & (~last_row)
+
+    source_address <- mux(
+        start_accepted,
+        source_base,
+        mux(advance_row,
+            truncate<64>(source_address + source_row_stride), source_address)
+    )
+    destination_address <- mux(
+        start_accepted,
+        destination_base,
+        mux(advance_row,
+            truncate<64>(destination_address + destination_row_stride),
+            destination_address)
+    )
+    dma_ub_base <- mux(start_accepted, ub_base, dma_ub_base)
+    source_row_stride <- mux(start_accepted, source_stride, source_row_stride)
+    destination_row_stride <- mux(
+        start_accepted, destination_stride, destination_row_stride
+    )
+    dma_length_bytes <- mux(start_accepted, row_bytes, dma_length_bytes)
+    rows_left <- mux(
+        start_accepted,
+        row_count,
+        mux(advance_row, rows_left - 1, rows_left)
+    )
+    error <- mux(
+        start_accepted,
+        0,
+        mux(transfer_failed, 1, error)
+    )
+    error_code <- mux(
+        start_accepted,
+        0,
+        mux(transfer_failed, dma_error_code, error_code)
+    )
+
+    busy = ~idle
+    done = done_state
+    dma_start = launch_dma
+    dma_direction = store_start_state
+    dma_dram_base = mux(
+        store_start_state, destination_address, source_address
+    )
+
+    fsm phase : ZtpuUbDcopyPhase = Idle {
+        Idle {
+            priority {
+                when start_accepted & empty_copy -> Done {}
+                when start_accepted -> LoadStart {}
+            }
+        }
+        LoadStart { when ~dma_busy -> LoadWait {} }
+        LoadWait {
+            priority {
+                when dma_done & dma_error -> Done {}
+                when dma_done -> StoreStart {}
+            }
+        }
+        StoreStart { when ~dma_busy -> StoreWait {} }
+        StoreWait {
+            priority {
+                when dma_done & (dma_error | last_row) -> Done {}
+                when dma_done -> LoadStart {}
+            }
+        }
+        Done { -> Idle {} }
+    }
+}

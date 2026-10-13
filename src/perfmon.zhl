@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+// Fixed specialization of the ZTPU performance and sticky-error monitor.
+module ZtpuPerfCounters32x8 {
+    clock clk reset rst
+
+    in enable, clear, clear_error : bit
+    in busy, command_start, dma_read, dma_write, error_event : bit
+    in error_code_in : u8
+
+    out cycles, busy_cycles, command_count : u32
+    out dma_read_count, dma_write_count, error_count : u32
+    out reg error_valid : bit = 0
+    out reg error_code : u8 = 0
+
+    reg counters : vec<6,u32> = generate(i in 0..6) 0
+
+    events : vec<6,bit> = [
+        1, busy, command_start, dma_read, dma_write, error_event
+    ]
+    counters <- generate(i in 0..6) mux(
+        clear,
+        0,
+        mux(enable & events[i], truncate<32>(counters[i] + 1), counters[i])
+    )
+    error_valid <- mux(
+        clear_error, 0, mux(error_event, 1, error_valid)
+    )
+    error_code <- mux(
+        clear_error, 0, mux(error_event, error_code_in, error_code)
+    )
+
+    cycles = counters[0]
+    busy_cycles = counters[1]
+    command_count = counters[2]
+    dma_read_count = counters[3]
+    dma_write_count = counters[4]
+    error_count = counters[5]
+}

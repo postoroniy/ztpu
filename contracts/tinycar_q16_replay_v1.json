@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "contract": "ztpu_tinycar_q16_replay_v1",
+  "source_language": "zlang",
+  "integration_top": "ZtpuQueuedQ16AhbTop4x4",
+  "mode": "inference",
+  "precision": "q16_exact",
+  "command_transport": "64_byte_descriptor_dma",
+  "command_count": 8596,
+  "stage_count": 911,
+  "mxu_tile": [4, 4, 4],
+  "ub_depth_words": 1024,
+  "mac_count": 135168,
+  "measured_engine_cycles_from_command_accept": 409297,
+  "measured_native_ahb_e2e_cycles": 409348,
+  "output": {
+    "shape": [8, 8, 6],
+    "checked_words": 384,
+    "decode": "host_side"
+  },
+  "excluded": [
+    "training",
+    "native_q8",
+    "packed_int8_systolic_compute",
+    "asic_backend",
+    "synthesis_and_physical_flow"
+  ],
+  "verification": "bounded_full_ahb_descriptor_replay"
+}

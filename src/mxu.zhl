@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.pe
+
+module ZtpuSystolicArray2x2Q16 {
+    clock clk
+    reset rst
+
+    in clear : bit
+    in input0, input1 : s16
+    in weight0, weight1 : s16
+    out output00, output01, output10, output11 : s32
+
+    inputs : vec<2,s16> = [input0, input1]
+    weights : vec<2,s16> = [weight0, weight1]
+    reg input_skew : vec<1,s16> = [0]
+    reg weight_skew : vec<1,s16> = [0]
+
+    input_skew <- [inputs[1]]
+    weight_skew <- [weights[1]]
+
+    inst pe[4] : ZtpuPeQ16
+    row_inputs : vec<2,s16> = [inputs[0], input_skew[0]]
+    column_weights : vec<2,s16> = [weights[0], weight_skew[0]]
+    pe_inputs : vec<4,s16> = [
+        row_inputs[0], pe[0].output_v,
+        row_inputs[1], pe[2].output_v
+    ]
+    pe_weights : vec<4,s16> = [
+        column_weights[0], column_weights[1],
+        pe[0].output_w, pe[1].output_w
+    ]
+    generate(cell in 0..4) {
+        pe[cell].input_v = pe_inputs[cell]
+        pe[cell].input_w = pe_weights[cell]
+        pe[cell].input_acc = mux(clear, 0, pe[cell].output_acc)
+    }
+
+    results : vec<4,s32> = generate(i in 0..4) pe[i].output_acc
+    output00 = results[0]
+    output01 = results[1]
+    output10 = results[2]
+    output11 = results[3]
+}
+
+module ZtpuSystolicArray4x4I32 {
+    clock clk
+    reset rst
+
+    in clear : bit
+    in input0, input1, input2, input3 : s32
+    in weight0, weight1, weight2, weight3 : s32
+    out output00, output01, output02, output03 : s32
+    out output10, output11, output12, output13 : s32
+    out output20, output21, output22, output23 : s32
+    out output30, output31, output32, output33 : s32
+
+    inputs : vec<4,s32> = [input0, input1, input2, input3]
+    weights : vec<4,s32> = [weight0, weight1, weight2, weight3]
+    reg input_skew : vec<6,s32> = generate(i in 0..6) 0
+    reg weight_skew : vec<6,s32> = generate(i in 0..6) 0
+
+    input_skew <- [
+        inputs[1],
+        inputs[2], input_skew[1],
+        inputs[3], input_skew[3], input_skew[4]
+    ]
+    weight_skew <- [
+        weights[1],
+        weights[2], weight_skew[1],
+        weights[3], weight_skew[3], weight_skew[4]
+    ]
+
+    inst pe[16] : ZtpuPeI32
+    row_inputs : vec<4,s32> = [
+        inputs[0], input_skew[0], input_skew[2], input_skew[5]
+    ]
+    column_weights : vec<4,s32> = [
+        weights[0], weight_skew[0], weight_skew[2], weight_skew[5]
+    ]
+    pe_inputs : vec<16,s32> = [
+        row_inputs[0], pe[0].output_v, pe[1].output_v, pe[2].output_v,
+        row_inputs[1], pe[4].output_v, pe[5].output_v, pe[6].output_v,
+        row_inputs[2], pe[8].output_v, pe[9].output_v, pe[10].output_v,
+        row_inputs[3], pe[12].output_v, pe[13].output_v, pe[14].output_v
+    ]
+    pe_weights : vec<16,s32> = [
+        column_weights[0], column_weights[1], column_weights[2], column_weights[3],
+        pe[0].output_w, pe[1].output_w, pe[2].output_w, pe[3].output_w,
+        pe[4].output_w, pe[5].output_w, pe[6].output_w, pe[7].output_w,
+        pe[8].output_w, pe[9].output_w, pe[10].output_w, pe[11].output_w
+    ]
+    generate(cell in 0..16) {
+        pe[cell].input_v = pe_inputs[cell]
+        pe[cell].input_w = pe_weights[cell]
+        pe[cell].input_acc = mux(clear, 0, pe[cell].output_acc)
+    }
+
+    results : vec<16,s32> = generate(i in 0..16) pe[i].output_acc
+    output00 = results[0]
+    output01 = results[1]
+    output02 = results[2]
+    output03 = results[3]
+    output10 = results[4]
+    output11 = results[5]
+    output12 = results[6]
+    output13 = results[7]
+    output20 = results[8]
+    output21 = results[9]
+    output22 = results[10]
+    output23 = results[11]
+    output30 = results[12]
+    output31 = results[13]
+    output32 = results[14]
+    output33 = results[15]
+}
+
+enum ZtpuMxuSequencerPhase { Idle Kick Stream Drain Done }
+enum ZtpuMxuFeederPhase { Idle Run Done }
+
+module ZtpuMxuMicroSequencer<DRAIN=4> {
+    clock clk
+    reset rst
+
+    in start : bit
+    in k_dim : u16
+    in feeder_done : bit
+    out kick, busy, done : bit
+
+    reg drain_count : u16 = 0
+
+    idle : bit = phase == ZtpuMxuSequencerPhase.Idle
+    kick_state : bit = phase == ZtpuMxuSequencerPhase.Kick
+    stream_state : bit = phase == ZtpuMxuSequencerPhase.Stream
+    drain_state : bit = phase == ZtpuMxuSequencerPhase.Drain
+    done_state : bit = phase == ZtpuMxuSequencerPhase.Done
+
+    next_drain_count : u16 = mux(
+        stream_state & feeder_done,
+        0,
+        mux(drain_state & (DRAIN != 0) & (drain_count != DRAIN),
+            truncate<16>(drain_count + 1), drain_count)
+    )
+
+    drain_count <- next_drain_count
+
+    kick = kick_state
+    busy = (~idle) & (~done_state)
+    done = done_state
+
+    fsm phase : ZtpuMxuSequencerPhase = Idle {
+        Idle { when start -> Kick {} }
+        Kick { -> Stream {} }
+        Stream { when feeder_done -> Drain {} }
+        Drain {
+            when (DRAIN == 0) | (drain_count == DRAIN) -> Done {}
+        }
+        Done { -> Idle {} }
+    }
+}
+
+module ZtpuMxuMicroSequencerD4 {
+    clock clk
+    reset rst
+    in start : bit
+    in k_dim : u16
+    in feeder_done : bit
+    out kick, busy, done : bit
+
+    inst sequencer : ZtpuMxuMicroSequencer<DRAIN=4> {
+        start k_dim feeder_done
+    }
+    kick = sequencer.kick
+    busy = sequencer.busy
+    done = sequencer.done
+}
+
+module ZtpuMxuMicroSequencerD6 {
+    clock clk
+    reset rst
+    in start : bit
+    in k_dim : u16
+    in feeder_done : bit
+    out kick, busy, done : bit
+
+    inst sequencer : ZtpuMxuMicroSequencer<DRAIN=6> {
+        start k_dim feeder_done
+    }
+    kick = sequencer.kick
+    busy = sequencer.busy
+    done = sequencer.done
+}
+
+fn unpack_i8x4(word : bits<32>) -> vec<4,s32> {
+    generate(i in 0..4)
+        extend<32>(bitcast<s8>(bitcast<vec<4,bits<8>>>(word)[i]))
+}
+
+fn unpack_i4x8(word : bits<32>) -> vec<8,s32> {
+    generate(i in 0..8)
+        extend<32>(bitcast<s4>(bitcast<vec<8,bits<4>>>(word)[i]))
+}
+
+module ZtpuMxuStreamFeeder4x4I8 {
+    clock clk
+    reset rst
+
+    in start : bit
+    in k_dim : u16
+    in b_format : u2
+    in sink_a_valid : bit
+    in sink_a_data : bits<32>
+    in sink_b_valid : bit
+    in sink_b_data : bits<32>
+    out sink_a_ready, sink_b_ready : bit
+    out busy, done, clear_pulse, step_valid : bit
+    out a0, a1, a2, a3 : s32
+    out b0, b1, b2, b3 : s32
+
+    reg index : u16 = 0
+
+    idle : bit = phase == ZtpuMxuFeederPhase.Idle
+    run_state : bit = phase == ZtpuMxuFeederPhase.Run
+    done_state : bit = phase == ZtpuMxuFeederPhase.Done
+    k_done : bit = index == k_dim
+    consume : bit = run_state & (~k_done) & sink_a_valid & sink_b_valid
+
+    next_index : u16 = mux(
+        idle & start,
+        0,
+        mux(consume, truncate<16>(index + 1), index)
+    )
+
+    index <- next_index
+
+    busy = run_state
+    done = done_state
+    clear_pulse = idle & start
+    step_valid = consume
+    sink_a_ready = consume
+    sink_b_ready = consume
+
+    unpacked_a : vec<4,s32> = unpack_i8x4(sink_a_data)
+    unpacked_b_q8 : vec<4,s32> = unpack_i8x4(sink_b_data)
+    unpacked_b_q4 : vec<8,s32> = unpack_i4x8(sink_b_data)
+    active_a : vec<4,s32> = generate(i in 0..4) mux(consume, unpacked_a[i], 0)
+    selected_b : vec<4,s32> = generate(i in 0..4)
+        mux(b_format == 1, unpacked_b_q4[i],
+            mux(b_format == 2, unpacked_b_q4[i + 4], unpacked_b_q8[i]))
+    active_b : vec<4,s32> = generate(i in 0..4) mux(consume, selected_b[i], 0)
+    a0 = active_a[0]
+    a1 = active_a[1]
+    a2 = active_a[2]
+    a3 = active_a[3]
+    b0 = active_b[0]
+    b1 = active_b[1]
+    b2 = active_b[2]
+    b3 = active_b[3]
+
+    fsm phase : ZtpuMxuFeederPhase = Idle {
+        Idle { when start -> Run {} }
+        Run { when k_done -> Done {} }
+        Done { -> Idle {} }
+    }
+}
+
+module ZtpuZeroSkipMask32 {
+    in enable : bit
+    in sink_valid : bit
+    in sink_data : bits<32>
+    in source_ready : bit
+    out sink_ready : bit
+    out source_valid : bit
+    out source_data : bits<32>
+    out mask : bits<4>
+    out mask_valid : bit
+    out nz_count : u3
+    out all_zero : bit
+
+    lanes : vec<4,bits<8>> = bitcast<vec<4,bits<8>>>(sink_data)
+    nonzero : vec<4,bit> = generate(i in 0..4) { lanes[i] != 0 }
+    computed_mask : bits<4> = bitcast<bits<4>>(nonzero)
+    computed_count : u3 = truncate<3>(
+        reduce(+, generate(i in 0..4) extend<3>(bitcast<u1>(nonzero[i])))
+    )
+
+    sink_ready = source_ready
+    source_valid = sink_valid
+    source_data = sink_data
+    mask = mux(enable, computed_mask, 0)
+    mask_valid = sink_valid
+    nz_count = mux(enable, computed_count, 0)
+    all_zero = mux(enable, computed_mask == 0, 1)
+}

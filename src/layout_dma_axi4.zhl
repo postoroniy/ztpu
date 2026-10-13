@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import std.bus.axi4
+import ztpu.layout_dma
+
+// Full AXI4 adaptation for the layout copy engine. The original accelerator
+// has one in-order transaction outstanding, so this profile uses ID zero.
+module ZtpuLayoutDmaAxi4Master64x32 {
+    clock clk reset rst
+    in enable : bit
+    in layout : rv<ZtpuLayoutAddressPair64>
+    out busy, done, error : bit
+    interface axi : AXI4<64,32,1,1>.master @clk
+
+    read_response : bits<2> = mux(axi.r.payload.id == 0,
+        axi.r.payload.resp, 2)
+    write_response : bits<2> = mux(axi.b.payload.id == 0,
+        axi.b.payload.resp, 2)
+
+    core : ZtpuLayoutDmaControl64x32 {
+        enable
+        layout_valid=layout.valid
+        layout_in_addr=layout.payload.in_addr
+        layout_out_addr=layout.payload.out_addr
+        read_ar_ready=axi.ar.ready
+        read_r_valid=axi.r.valid
+        read_r_data=axi.r.payload.data
+        read_r_last=axi.r.payload.last
+        read_r_resp=read_response
+        write_aw_ready=axi.aw.ready
+        write_w_ready=axi.w.ready
+        write_b_valid=axi.b.valid
+        write_b_resp=write_response
+    }
+
+    layout.ready = core.layout_ready
+    busy = core.busy
+    done = core.done
+    error = core.error
+
+    axi.ar.valid = core.read_ar_valid
+    axi.ar.payload = Axi4Address {
+        id = 0
+        addr = core.read_ar_addr
+        len = core.read_ar_len
+        size = core.read_ar_size
+        burst = 1
+        lock = 0
+        cache = 0
+        prot = 0
+        qos = 0
+        region = 0
+    }
+    axi.r.ready = core.read_r_ready
+
+    axi.aw.valid = core.write_aw_valid
+    axi.aw.payload = Axi4Address {
+        id = 0
+        addr = core.write_aw_addr
+        len = core.write_aw_len
+        size = core.write_aw_size
+        burst = 1
+        lock = 0
+        cache = 0
+        prot = 0
+        qos = 0
+        region = 0
+    }
+    axi.w.valid = core.write_w_valid
+    axi.w.payload = Axi4WriteData {
+        data = core.write_w_data
+        strb = 15
+        last = core.write_w_last
+    }
+    axi.b.ready = core.write_b_ready
+}

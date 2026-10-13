@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_vmu_elementwise_q16_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbVmuElementwiseQ16",
+  "address_width": 64,
+  "data_width": 32,
+  "count_width": 16,
+  "fixed_point": "Q16.16",
+  "supported_operations": {
+    "relu": 9,
+    "saturating_add": 11,
+    "saturating_scale_q16": 12,
+    "relu_backward": 13
+  },
+  "unsupported_operation_behavior": "one_done_cycle_without_ub_traffic",
+  "zero_length_behavior": "process_one_word_to_match_reference",
+  "excluded": [
+    "exp",
+    "log",
+    "reductions",
+    "softmax_forward_backward",
+    "rmsnorm_forward_backward",
+    "q16_to_q8_pack"
+  ],
+  "timing": "cycle_exact"
+}

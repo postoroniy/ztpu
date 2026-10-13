@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.fxp_math
+
+enum ZtpuUbAdamPhase {
+    Idle
+    InverseStart
+    InverseWait
+    ReadMG
+    ReadVW
+    WriteM
+    WriteV
+    RsqrtStart
+    RsqrtWait
+    WriteW
+    Done
+}
+
+fn ztpu_adam_sat_s32_from_s33(value : s33) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+fn ztpu_adam_sat_s32_from_s64(value : s64) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+fn ztpu_adam_sat_add_s32(a : s32, b : s32) -> s32 {
+    ztpu_adam_sat_s32_from_s33(
+        truncate<33>(extend<33>(a) + extend<33>(b))
+    )
+}
+
+fn ztpu_adam_sat_sub_s32(a : s32, b : s32) -> s32 {
+    ztpu_adam_sat_s32_from_s33(
+        truncate<33>(extend<33>(a) - extend<33>(b))
+    )
+}
+
+fn ztpu_adam_sat_mul_q16_s32(a : s32, b : s32) -> s32 {
+    ztpu_adam_sat_s32_from_s64(
+        truncate<64>((a * b) + 32768) >> 16
+    )
+}
+
+module ZtpuUbAdamQ16 {
+    clock clk reset rst
+
+    in start, clear_state : bit
+    in w_base, g_base, m_base, v_base : uint<64>
+    in length : u16
+    in learning_rate, beta1, beta2, epsilon : s32
+
+    out busy, done, error : bit
+    out reg b1t : u32 = 65536
+    out reg b2t : u32 = 65536
+
+    out ub_read0_valid : bit
+    in ub_read0_ready : bit
+    out ub_read0_addr : uint<64>
+    in ub_read0_data : bits<32>
+
+    out ub_read1_valid : bit
+    in ub_read1_ready : bit
+    out ub_read1_addr : uint<64>
+    in ub_read1_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    inst reciprocal_b1 : ZtpuReciprocalNr2Q16
+    inst reciprocal_b2 : ZtpuReciprocalNr2Q16
+    inst reciprocal_sqrt : ZtpuRsqrtNr2Q16
+
+    reg index : u16 = 0
+    reg weight_address : uint<64> = 0
+    reg gradient_address : uint<64> = 0
+    reg moment1_address : uint<64> = 0
+    reg moment2_address : uint<64> = 0
+    reg word_count : u16 = 0
+
+    reg moment1_old : s32 = 0
+    reg moment2_old : s32 = 0
+    reg weight_old : s32 = 0
+    reg gradient_value : s32 = 0
+    reg moment1_new : s32 = 0
+    reg moment2_new : s32 = 0
+    reg weight_new : s32 = 0
+    reg inverse_one_minus_b1t : s32 = 0
+    reg inverse_one_minus_b2t : s32 = 0
+    reg rsqrt_input : u32 = 0
+    reg moment1_hat : s32 = 0
+    reg inverse_input_b1 : u32 = 0
+    reg inverse_input_b2 : u32 = 0
+
+    idle : bit = phase == ZtpuUbAdamPhase.Idle
+    inverse_start_state : bit = phase == ZtpuUbAdamPhase.InverseStart
+    inverse_wait_state : bit = phase == ZtpuUbAdamPhase.InverseWait
+    read_m_g_state : bit = phase == ZtpuUbAdamPhase.ReadMG
+    read_v_w_state : bit = phase == ZtpuUbAdamPhase.ReadVW
+    write_m_state : bit = phase == ZtpuUbAdamPhase.WriteM
+    write_v_state : bit = phase == ZtpuUbAdamPhase.WriteV
+    rsqrt_start_state : bit = phase == ZtpuUbAdamPhase.RsqrtStart
+    rsqrt_wait_state : bit = phase == ZtpuUbAdamPhase.RsqrtWait
+    write_w_state : bit = phase == ZtpuUbAdamPhase.WriteW
+    done_state : bit = phase == ZtpuUbAdamPhase.Done
+
+    start_accepted : bit = idle & start
+    read_m_g_fire : bit = read_m_g_state & ub_read0_ready & ub_read1_ready
+    read_v_w_fire : bit = read_v_w_state & ub_read0_ready & ub_read1_ready
+    write_m_fire : bit = write_m_state & ub_write_ready
+    write_v_fire : bit = write_v_state & ub_write_ready
+    write_w_fire : bit = write_w_state & ub_write_ready
+
+    byte_offset : uint<64> = extend<64>(index) << 2
+    indexed_m_address : uint<64> = truncate<64>(moment1_address + byte_offset)
+    indexed_v_address : uint<64> = truncate<64>(moment2_address + byte_offset)
+    indexed_w_address : uint<64> = truncate<64>(weight_address + byte_offset)
+    indexed_g_address : uint<64> = truncate<64>(gradient_address + byte_offset)
+    next_index : u17 = truncate<17>(extend<17>(index) + 1)
+    last_word : bit = next_index >= extend<17>(word_count)
+
+    b1t_current : u32 = mux(clear_state, 65536, b1t)
+    b2t_current : u32 = mux(clear_state, 65536, b2t)
+    b1t_next : s32 = ztpu_adam_sat_mul_q16_s32(bitcast<s32>(b1t_current), beta1)
+    b2t_next : s32 = ztpu_adam_sat_mul_q16_s32(bitcast<s32>(b2t_current), beta2)
+    one_minus_b1t : s32 = ztpu_adam_sat_sub_s32(65536, b1t_next)
+    one_minus_b2t : s32 = ztpu_adam_sat_sub_s32(65536, b2t_next)
+
+    one_minus_b1 : s32 = ztpu_adam_sat_sub_s32(65536, beta1)
+    one_minus_b2 : s32 = ztpu_adam_sat_sub_s32(65536, beta2)
+    gradient_squared : s32 = ztpu_adam_sat_mul_q16_s32(
+        gradient_value, gradient_value
+    )
+    moment1_expression : s32 = ztpu_adam_sat_add_s32(
+        ztpu_adam_sat_mul_q16_s32(beta1, moment1_old),
+        ztpu_adam_sat_mul_q16_s32(one_minus_b1, gradient_value)
+    )
+    current_moment2 : s32 = bitcast<s32>(ub_read0_data)
+    moment2_expression : s32 = ztpu_adam_sat_add_s32(
+        ztpu_adam_sat_mul_q16_s32(beta2, current_moment2),
+        ztpu_adam_sat_mul_q16_s32(one_minus_b2, gradient_squared)
+    )
+    moment1_hat_next : s32 = ztpu_adam_sat_mul_q16_s32(
+        moment1_expression, inverse_one_minus_b1t
+    )
+    moment2_hat_next : s32 = ztpu_adam_sat_mul_q16_s32(
+        moment2_expression, inverse_one_minus_b2t
+    )
+    moment2_hat_epsilon : s32 = ztpu_adam_sat_add_s32(
+        moment2_hat_next, epsilon
+    )
+    rsqrt_input_next : u32 = mux(
+        moment2_hat_epsilon <= 0,
+        1,
+        bitcast<u32>(moment2_hat_epsilon)
+    )
+    update_direction : s32 = ztpu_adam_sat_mul_q16_s32(
+        moment1_hat, bitcast<s32>(reciprocal_sqrt.y)
+    )
+    update_step : s32 = ztpu_adam_sat_mul_q16_s32(
+        learning_rate, update_direction
+    )
+    weight_next : s32 = ztpu_adam_sat_sub_s32(weight_old, update_step)
+
+    reciprocal_b1.start = inverse_start_state
+    reciprocal_b1.x = inverse_input_b1
+    reciprocal_b2.start = inverse_start_state
+    reciprocal_b2.x = inverse_input_b2
+    reciprocal_sqrt.start = rsqrt_start_state
+    reciprocal_sqrt.x = rsqrt_input
+
+    index <- mux(
+        start_accepted,
+        0,
+        mux(write_w_fire & (~last_word), truncate<16>(index + 1), index)
+    )
+    weight_address <- mux(start_accepted, w_base, weight_address)
+    gradient_address <- mux(start_accepted, g_base, gradient_address)
+    moment1_address <- mux(start_accepted, m_base, moment1_address)
+    moment2_address <- mux(start_accepted, v_base, moment2_address)
+    word_count <- mux(start_accepted, length, word_count)
+    b1t <- mux(
+        start_accepted,
+        bitcast<u32>(b1t_next),
+        mux(idle & clear_state, 65536, b1t)
+    )
+    b2t <- mux(
+        start_accepted,
+        bitcast<u32>(b2t_next),
+        mux(idle & clear_state, 65536, b2t)
+    )
+    inverse_input_b1 <- mux(
+        start_accepted, bitcast<u32>(one_minus_b1t), inverse_input_b1
+    )
+    inverse_input_b2 <- mux(
+        start_accepted, bitcast<u32>(one_minus_b2t), inverse_input_b2
+    )
+    inverse_one_minus_b1t <- mux(
+        inverse_wait_state & reciprocal_b1.done & reciprocal_b2.done,
+        bitcast<s32>(reciprocal_b1.y),
+        inverse_one_minus_b1t
+    )
+    inverse_one_minus_b2t <- mux(
+        inverse_wait_state & reciprocal_b1.done & reciprocal_b2.done,
+        bitcast<s32>(reciprocal_b2.y),
+        inverse_one_minus_b2t
+    )
+    moment1_old <- mux(read_m_g_fire, bitcast<s32>(ub_read0_data), moment1_old)
+    gradient_value <- mux(read_m_g_fire, bitcast<s32>(ub_read1_data), gradient_value)
+    moment2_old <- mux(read_v_w_fire, bitcast<s32>(ub_read0_data), moment2_old)
+    weight_old <- mux(read_v_w_fire, bitcast<s32>(ub_read1_data), weight_old)
+    moment1_new <- mux(read_v_w_fire, moment1_expression, moment1_new)
+    moment2_new <- mux(read_v_w_fire, moment2_expression, moment2_new)
+    moment1_hat <- mux(read_v_w_fire, moment1_hat_next, moment1_hat)
+    rsqrt_input <- mux(read_v_w_fire, rsqrt_input_next, rsqrt_input)
+    weight_new <- mux(
+        rsqrt_wait_state & reciprocal_sqrt.done, weight_next, weight_new
+    )
+
+    ub_read0_valid = read_m_g_state | read_v_w_state
+    ub_read0_addr = mux(
+        read_m_g_state, indexed_m_address,
+        mux(read_v_w_state, indexed_v_address, 0)
+    )
+    ub_read1_valid = read_m_g_state | read_v_w_state
+    ub_read1_addr = mux(
+        read_m_g_state, indexed_g_address,
+        mux(read_v_w_state, indexed_w_address, 0)
+    )
+    ub_write_valid = write_m_state | write_v_state | write_w_state
+    ub_write_addr = mux(
+        write_m_state, indexed_m_address,
+        mux(write_v_state, indexed_v_address,
+            mux(write_w_state, indexed_w_address, 0))
+    )
+    ub_write_data = bitcast<bits<32>>(
+        mux(write_m_state, moment1_new,
+            mux(write_v_state, moment2_new,
+                mux(write_w_state, weight_new, 0)))
+    )
+    ub_write_mask = 15
+    busy = ~idle
+    done = done_state
+    error = 0
+
+    fsm phase : ZtpuUbAdamPhase = Idle {
+        Idle { when start_accepted -> InverseStart {} }
+        InverseStart { -> InverseWait {} }
+        InverseWait {
+            priority {
+                when reciprocal_b1.done & reciprocal_b2.done &
+                    (word_count == 0) -> Done {}
+                when reciprocal_b1.done & reciprocal_b2.done -> ReadMG {}
+            }
+        }
+        ReadMG { when read_m_g_fire -> ReadVW {} }
+        ReadVW { when read_v_w_fire -> WriteM {} }
+        WriteM { when write_m_fire -> WriteV {} }
+        WriteV { when write_v_fire -> RsqrtStart {} }
+        RsqrtStart { -> RsqrtWait {} }
+        RsqrtWait { when reciprocal_sqrt.done -> WriteW {} }
+        WriteW {
+            priority {
+                when write_w_fire & last_word -> Done {}
+                when write_w_fire -> ReadMG {}
+            }
+        }
+        Done { -> Idle {} }
+    }
+}

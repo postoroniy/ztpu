@@ -1,0 +1,32 @@
+{
+  "schema": "ztpu-arithmetic-contract-v1",
+  "modules": {
+    "ZtpuActivationQ16x4": {
+      "lanes": 4,
+      "width": 16,
+      "latency_cycles": 1,
+      "activation_codes": {
+        "passthrough": 0,
+        "relu": 1,
+        "sigmoid_piecewise": 2,
+        "invalid_zero": 3
+      }
+    },
+    "ZtpuBiasAccumulateQ16x4": {
+      "lanes": 4,
+      "width": 16,
+      "accumulator": "signed_wrap_16",
+      "output": "signed_wrap_16(next_accumulator + bias)"
+    },
+    "ZtpuAccRequant": {
+      "input_width": 32,
+      "scale_width": 32,
+      "shift_width": 6,
+      "output_widths": [8, 16, 32],
+      "rounding": "add_half_before_arithmetic_right_shift",
+      "overflow": "signed_saturate",
+      "disabled": "low_output_bits_of_input"
+    }
+  },
+  "reference_revision": "9489dae7233e92993c97e94b86365452b92ac73a"
+}

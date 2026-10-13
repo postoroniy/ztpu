@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "contract": "ztpu_command_descriptor_dma_v1",
+  "source_language": "zlang",
+  "top": "ZtpuCommandDescriptorDma64x24",
+  "address_width": 64,
+  "data_width": 32,
+  "count_width": 24,
+  "descriptor_words": 16,
+  "descriptor_bytes": 64,
+  "base_alignment_bytes": 64,
+  "axi_profile": "single_outstanding_fixed_16_beat_read",
+  "descriptor_unions": ["generic_vmu_dcopy", "mxu", "adam"],
+  "output_protocol": "ready_valid_holds_decoded_descriptor_until_accepted",
+  "error_codes": {
+    "unaligned_base": 1,
+    "axi_read_response": 2,
+    "incorrect_rlast": 3
+  },
+  "zero_count_behavior": "done_without_axi_traffic",
+  "timing": "cycle_exact"
+}

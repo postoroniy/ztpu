@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "contract": "ztpu_storage_v1",
+  "source_language": "zlang",
+  "modules": {
+    "stream_fifo": {
+      "top": "ZtpuStreamFifo32x4",
+      "data_width": 32,
+      "logical_depth": 4,
+      "memory_implementation": "zlang_fifo",
+      "timing": "cycle_exact",
+      "full_queue_push_policy": "reject_even_if_same_cycle_pop"
+    },
+    "completion_queue": {
+      "top": "ZtpuCompletionQueue8",
+      "logical_depth": 8,
+      "fields": ["tag:8", "opcode:4", "status:4", "error:8"],
+      "timing": "cycle_exact",
+      "overflow": "sticky_until_clear"
+    }
+  }
+}

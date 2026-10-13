@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_mxu_feeder_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbMxuFeeder4x4I8",
+  "rows": 4,
+  "columns": 4,
+  "packed_word_width": 32,
+  "lane_width": 8,
+  "expanded_width": 32,
+  "address_width": 64,
+  "k_width": 16,
+  "read_ports": 2,
+  "read_lockstep": true,
+  "address_step_bytes": 4,
+  "timing": "cycle_exact"
+}

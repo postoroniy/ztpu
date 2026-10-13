@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "contract": "ztpu_unified_buffer_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUnifiedBuffer256x32",
+  "data_width": 32,
+  "address_width": 64,
+  "logical_depth_words": 256,
+  "banks": 4,
+  "read_ports": 2,
+  "write_ports": 1,
+  "write_mask_lanes": 4,
+  "read_latency_cycles": 0,
+  "write_commit": "rising_edge",
+  "collision": "read_first",
+  "reset_contents": "preserve",
+  "addressing": "low_8_bits_of_byte_address_shifted_right_2",
+  "timing": "cycle_exact"
+}

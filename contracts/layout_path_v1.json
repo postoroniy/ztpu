@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "contract": "ztpu_layout_path_v1",
+  "source_language": "zlang",
+  "tops": [
+    "ZtpuLayoutTranspose64",
+    "ZtpuTiler64x256",
+    "ZtpuLayoutPath64x32"
+  ],
+  "address_remap": {
+    "layouts": ["NCHW", "NHWC", "NCHWc4"],
+    "iteration_order": ["n", "h", "w", "c"],
+    "dimensions": {"n_max": 4, "c_max": 64, "h_max": 64, "w_max": 64},
+    "done": "asserted_while_final_item_is_valid",
+    "blocked_channels": "multiple_of_4_required"
+  },
+  "tiler": {
+    "rows_max": 256,
+    "cols_max": 256,
+    "order": "row_major",
+    "address": "base_plus_row_times_row_stride_plus_col_times_col_stride"
+  },
+  "dma": "one_aligned_32_bit_copy_per_address_pair",
+  "fences": {
+    "range": "half_open_base_limit",
+    "read_master_id": 5,
+    "write_master_id": 6,
+    "effective_range": "intersection(global,layout_domain,per_master)"
+  },
+  "arbitration": "shared_with_queued_ub_master_owner_held_through_response",
+  "verification": [
+    "native_jit_vs_generated_verilator",
+    "ahb_to_layout_dma_shared_axi_replay"
+  ]
+}

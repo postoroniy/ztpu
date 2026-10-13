@@ -1,0 +1,19 @@
+{
+  "schema": "ztpu-simulator-scenarios-v1",
+  "scenarios": [
+    {
+      "name": "native_ahb_cfgbus",
+      "source": "src/cfgbus.zhl",
+      "top": "ZtpuQueuedCfgAhb64x32",
+      "builder": "native_ahb_cfgbus",
+      "timeout_seconds": 180
+    },
+    {
+      "name": "queued_top_direct_ub_dma",
+      "source": "src/queued_q16_ahb_top.zhl",
+      "top": "ZtpuQueuedQ16AhbTop",
+      "builder": "queued_top_direct_ub_dma",
+      "timeout_seconds": 420
+    }
+  ]
+}

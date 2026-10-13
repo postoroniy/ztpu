@@ -1,0 +1,19 @@
+{
+  "schema": "ztpu-block-contract-v1",
+  "module": "ZtpuPeQ16",
+  "reference": "ip/pe.py:ProcessingElement(16,32)",
+  "clock": "rising_edge",
+  "reset": "synchronous_active_high",
+  "latency_cycles": 1,
+  "arithmetic": "signed_wrap_s32(input_acc + input_v * input_w)",
+  "ports": [
+    {"name": "clk", "direction": "input", "width": 1},
+    {"name": "rst", "direction": "input", "width": 1},
+    {"name": "input_v", "direction": "input", "width": 16, "signed": true},
+    {"name": "input_w", "direction": "input", "width": 16, "signed": true},
+    {"name": "input_acc", "direction": "input", "width": 32, "signed": true},
+    {"name": "output_acc", "direction": "output", "width": 32, "signed": true},
+    {"name": "output_v", "direction": "output", "width": 16, "signed": true},
+    {"name": "output_w", "direction": "output", "width": 16, "signed": true}
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "contract": "ztpu_queued_native_q8_v1",
+  "source_language": "zlang",
+  "integration_top": "ZtpuQueuedQ16AhbTop4x4",
+  "quality_contract": "measured_experiment_only",
+  "signoff_contract": "q16_exact",
+  "command_transport": "64_byte_descriptor_dma",
+  "compute_opcode": 5,
+  "native_i8_modes": [0, 1, 2],
+  "q16_mode": 3,
+  "selection": "descriptor_mxu_mode",
+  "tile": {
+    "rows": 4,
+    "columns": 4,
+    "packed_lanes": 4,
+    "lane_width": 8,
+    "accumulator_width": 32
+  },
+  "descriptor_controls": [
+    "accumulate",
+    "accumulator_clear",
+    "spill_restore",
+    "requant_enable_scale_shift_zero",
+    "transpose",
+    "zero_skip_enable"
+  ],
+  "bounded_linear_tile_replay": {
+    "command_count": 4,
+    "stage_count": 1,
+    "output_shape": [4, 4],
+    "checked_words": 16,
+    "measured_engine_cycles_from_command_accept": 157,
+    "measured_native_ahb_e2e_cycles": 220
+  },
+  "bounded_microgpt_replay": {
+    "model": "two_layer_seq8_vocab16_embd8_head2_mlp16",
+    "precision": "hybrid_q8",
+    "native_q8_scope": "static_weight_linears",
+    "q16_scope": "embeddings_norm_softmax_dynamic_attention",
+    "command_count": 3010,
+    "stage_count": 161,
+    "checked_words": 448,
+    "ub_required_depth_words": 128,
+    "packed_weight_words": 288,
+    "measured_engine_cycles_from_command_accept": 63955,
+    "measured_native_ahb_e2e_cycles": 64006,
+    "q8_model_signoff": false
+  },
+  "zero_skip_status": {
+    "control_address": "0x0314",
+    "queued_command_control_address": "0x0404",
+    "steps_address": "0x0318",
+    "total_macs_address": "0x031c",
+    "active_macs_address": "0x0320",
+    "skipped_macs_address": "0x0324",
+    "linear_tile_counts": [5, 80, 58, 22],
+    "q16_mode_reports_zero": true
+  },
+  "excluded": [
+    "direct_host_requantization_registers",
+    "w4a8_unpack",
+    "asic_backend",
+    "synthesis_and_physical_flow"
+  ],
+  "verification": "bounded_linear_tile_and_model_ahb_descriptor_replay"
+}

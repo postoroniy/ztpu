@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_mxu_compute_q16_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbMxuCompute2x2Q16",
+  "rows": 2,
+  "columns": 2,
+  "data_width": 32,
+  "accumulator_width": 32,
+  "address_width": 64,
+  "k_width": 16,
+  "mode": 3,
+  "fixed_point": "Q16",
+  "features": [
+    "saturating_mac",
+    "independent_read_backpressure",
+    "write_backpressure",
+    "row_stride",
+    "transpose_addressing",
+    "accumulate",
+    "accumulator_clear",
+    "accumulator_spill_restore"
+  ],
+  "excluded": [
+    "packed_int8_systolic_modes",
+    "accumulator_requantization",
+    "zero_skip_counters",
+    "parameterized_rows_columns"
+  ],
+  "timing": "cycle_exact"
+}

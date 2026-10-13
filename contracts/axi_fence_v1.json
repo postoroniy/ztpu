@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "contract": "ztpu_axi_fence_v1",
+  "source_language": "zlang",
+  "tops": ["ZtpuAxiReadFence64x32", "ZtpuAxiWriteFence64x32"],
+  "address_width": 64,
+  "data_width": 32,
+  "range": "half_open_base_limit_over_complete_burst",
+  "end_address_width": 74,
+  "disabled_behavior": "transparent",
+  "blocked_read": "accept_ar_and_synthesize_requested_slverr_beats",
+  "blocked_write": "accept_aw_consume_w_and_synthesize_slverr_b",
+  "blocked_outstanding": 1,
+  "verification": "direct_protocol_tests_and_native_vs_verilator_scenarios"
+}

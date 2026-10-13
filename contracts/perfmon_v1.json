@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "contract": "ztpu_perfmon_v1",
+  "source_language": "zlang",
+  "top": "ZtpuPerfCounters32x8",
+  "counter_width": 32,
+  "error_code_width": 8,
+  "counters": [
+    "cycles",
+    "busy_cycles",
+    "command_count",
+    "dma_read_count",
+    "dma_write_count",
+    "error_count"
+  ],
+  "clear_priority": "counter_clear_over_enable_events",
+  "sticky_error_priority": "clear_error_over_error_event",
+  "verification": "direct_priority_and_counter_tests"
+}

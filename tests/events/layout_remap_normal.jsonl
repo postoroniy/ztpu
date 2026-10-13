@@ -1,0 +1,9 @@
+{"reset":{"rst":true},"set":{"start":0,"layout_in":0,"layout_out":1,"base_in":4096,"base_out":8192,"in_stride_n":256,"in_stride_c":4,"in_stride_h":32,"in_stride_w":8,"in_stride_cb":4,"out_stride_n":256,"out_stride_c":4,"out_stride_h":32,"out_stride_w":8,"out_stride_cb":4,"n_dim":1,"c_dim":2,"h_dim":1,"w_dim":2,"stream_ready":0},"edges":["clk"]}
+{"reset":{"rst":false}}
+{"set":{"start":1},"edges":["clk"]}
+{"set":{"start":0},"edges":["clk"]}
+{"set":{"stream_ready":1},"edges":["clk"]}
+{"edges":["clk"]}
+{"set":{"stream_ready":0},"edges":["clk"]}
+{"set":{"stream_ready":1},"edges":["clk"]}
+{"edges":["clk"]}

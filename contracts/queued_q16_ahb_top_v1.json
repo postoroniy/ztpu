@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "contract": "ztpu_queued_q16_ahb_top_v1",
+  "source_language": "zlang",
+  "cfgbus_top": "ZtpuQueuedCfgAhb64x32",
+  "integration_top": "ZtpuQueuedQ16AhbTop",
+  "ahb": {
+    "profile": "amba3_ahb_lite_single_manager_full_width",
+    "address_width": 32,
+    "data_width": 32,
+    "transfer_size": "word_only",
+    "latency": "registered_request_response_with_hreadyout_stalls",
+    "write_data": "ahb_data_phase_after_accepted_address",
+    "outstanding": 1,
+    "reset": "synchronous_active_high",
+    "error": "two_cycle_ahb_lite_error_for_invalid_address_nonword_or_misaligned"
+  },
+  "register_map": "banks_split_at_0x0300",
+  "command_submission": {
+    "push_address": "0x00e4",
+    "capture": "one_pending_snapshot_until_queue_accept",
+    "arbitration": "pending_ahb_command_before_descriptor_dma"
+  },
+  "completion": {
+    "control": "0x0200",
+    "status": "0x0204",
+    "head": "0x0208",
+    "pop": "0x020c",
+    "irq": "completion_irq_enable_and_valid_or_overflow"
+  },
+  "fences": {
+    "global": "0x0210..0x0220",
+    "layout_domain": "0x0238..0x0248",
+    "ub_domain": "0x024c..0x025c",
+    "layout_read_master": "0x02c4..0x02d4",
+    "layout_write_master": "0x02d8..0x02e8",
+    "ub_read_master": "0x02ec..0x02fc",
+    "ub_write_master": "0x0300..0x0310",
+    "fault_status": "0x0470..0x047c"
+  },
+  "layout": {
+    "control_and_remap": "0x0080..0x00e0",
+    "tiler": "0x0150..0x016c",
+    "queued_opcodes": {
+      "remap_completion": 1,
+      "dma_terminal_completion": 2
+    },
+    "read_master_id": 5,
+    "write_master_id": 6,
+    "effective_range": "intersection(global,layout_domain,layout_master)",
+    "shared_axi_arbitration": "fixed_priority_owner_held_through_rlast_or_b"
+  },
+  "command_dma": "0x0480..0x0494",
+  "debug": {
+    "registers": "0x040c..0x046c",
+    "sources": "live_config_snapshot_queue_input_output_first_push_head_queue_state_and_ub_dma_launch",
+    "queue_snapshots": "first_committed_push_and_first_nonempty_head_are_sticky_until_reset"
+  },
+  "performance": "0x0060..0x007c",
+  "zero_skip": {
+    "control": "0x0314",
+    "status": "0x0318..0x0324",
+    "queued_command_control": "0x0404"
+  },
+  "direct_engines": {
+    "ub_dma": "0x0190..0x01a8",
+    "ub_mxu": "0x01b0..0x01fc,0x0314,0x03bc",
+    "adam": "0x0328..0x0368",
+    "vmu": "0x036c..0x03a0",
+    "register_behavior": "defined_by_cfgbus_contracts",
+    "execution": "shared_fenced_axi_ub_and_compute_engines_without_command_or_completion_queue_entry",
+    "arbitration": "direct_request_priority_dma_then_mxu_then_adam_then_vmu_before_queued_dispatch"
+  },
+  "long_replay": {
+    "completion_policy": "disable_completion_queue_and_poll_command_count_queue_empty_final_tag",
+    "engine_enable_policy": "ub_mxu_vmu_enabled_internally",
+    "first_workload": "two_layer_microgpt_q16_inference_391_descriptors"
+  },
+  "excluded": [
+    "asic_backend",
+    "synthesis_and_physical_flow"
+  ],
+  "verification": {
+    "cfgbus": "direct_systemverilog_protocol_tests",
+    "queued_slice": "direct_systemverilog_hierarchical_fence_execution",
+    "integration_top": "bounded_systemverilog_replay_for_queued_ub_load_store",
+    "microgpt": "bounded_exact_q16_ahb_descriptor_dma_replay"
+  }
+}

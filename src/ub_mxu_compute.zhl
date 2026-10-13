@@ -1,0 +1,697 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.arithmetic
+import ztpu.mxu
+import ztpu.storage
+import ztpu.ub_stream
+
+enum ZtpuUbMxuI8Phase {
+    Idle
+    Restore
+    Clear
+    Compute
+    Write
+    Spill
+    Done
+}
+
+enum ZtpuUbMxuQ16Phase {
+    Idle
+    Restore
+    Clear
+    Spill
+    Done
+    Q16Init
+    Q16Run
+}
+
+fn ztpu_sat_s32_from_s64(value : s64) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+fn ztpu_sat_s32_from_s65(value : s65) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+module ZtpuAccumulatorNx32<D=4,IW=index_width(D)>
+where D >= 2 && is_power_of_two(D) && IW == floor_log2(D) {
+    clock clk reset rst
+
+    in read_address : uint<IW>
+    in write_enable : bit
+    in write_address : uint<IW>
+    in write_data : s32
+    in write_mask : bits<4>
+    out read_data : s32
+
+    memory table : mem<s32,D> {
+        read_latency 0
+        collision read_first
+        reset { contents preserve read_data preserve }
+    }
+    table.read_address = read_address
+    table.write_enable = write_enable
+    table.write_address = write_address
+    table.write_data = write_data
+    table.write_mask = write_mask
+    read_data = table.read_data
+}
+
+// Packed 4x4 path. Modes 0..2 consume Q8 B lanes; modes 4/5 consume the
+// low/high Q4 nibbles. Their distinction is encoded by operand layout. Mode 3
+// selects the exact-Q16 engine below.
+module ZtpuUbMxuCompute4x4I8 {
+    clock clk reset rst
+
+    in start : bit
+    in a_base, b_base, c_base, acc_base : uint<64>
+    in a_stride, b_stride : uint<64>
+    in a_transpose, b_transpose : bit
+    in k_dim : u16
+    in mode : u3
+    in accum_enable, acc_clear, spill_enable, restore_enable : bit
+    in rq_enable : bit
+    in rq_scale : s32
+    in rq_shift : u8
+    in rq_zero : s32
+    in zs_enable_a, zs_enable_b : bit
+
+    out busy, done : bit
+    out zs_steps, zs_total_macs, zs_active_macs, zs_skipped_macs : u32
+
+    out ub_read_a_valid : bit
+    in ub_read_a_ready : bit
+    out ub_read_a_addr : uint<64>
+    in ub_read_a_data : bits<32>
+
+    out ub_read_b_valid : bit
+    in ub_read_b_ready : bit
+    out ub_read_b_addr : uint<64>
+    in ub_read_b_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    reg out_row : u2 = 0
+    reg out_col : u2 = 0
+    reg clear_index : u4 = 0
+    reg acc_io_index : u4 = 0
+    reg compute_armed : bit = 0
+    reg zs_steps_state : u32 = 0
+    reg zs_total_state : u32 = 0
+    reg zs_active_state : u32 = 0
+    reg zs_skipped_state : u32 = 0
+
+    idle : bit = phase == ZtpuUbMxuI8Phase.Idle
+    restore_state : bit = phase == ZtpuUbMxuI8Phase.Restore
+    clear_state : bit = phase == ZtpuUbMxuI8Phase.Clear
+    compute_state : bit = phase == ZtpuUbMxuI8Phase.Compute
+    write_state : bit = phase == ZtpuUbMxuI8Phase.Write
+    spill_state : bit = phase == ZtpuUbMxuI8Phase.Spill
+    done_state : bit = phase == ZtpuUbMxuI8Phase.Done
+
+    mode_valid : bit = (mode <= 2) | ((mode >= 4) & (mode <= 5))
+    do_compute : bit = (k_dim != 0) & mode_valid
+    flat_index : u4 = truncate<4>((extend<4>(out_row) * 4) + extend<4>(out_col))
+    c_address : uint<64> = truncate<64>(c_base + (extend<64>(flat_index) << 2))
+    acc_address : uint<64> = truncate<64>(acc_base + (extend<64>(acc_io_index) << 2))
+
+    inst a_reader : ZtpuUbStreamReader32
+    inst b_reader : ZtpuUbStreamReader32
+    inst a_fifo : ZtpuStreamFifo32x8
+    inst b_fifo : ZtpuStreamFifo32x8
+    inst zs_a : ZtpuZeroSkipMask32
+    inst zs_b : ZtpuZeroSkipMask32
+    inst feeder : ZtpuMxuStreamFeeder4x4I8
+    inst mxu : ZtpuSystolicArray4x4I32
+    inst microseq : ZtpuMxuMicroSequencerD6
+    inst accumulator : ZtpuAccumulatorNx32<D=16,IW=4>
+    inst requant : ZtpuAccRequant32
+
+    kick_pulse : bit = compute_state & microseq.kick
+
+    a_reader.start = kick_pulse
+    a_reader.base = a_base
+    a_reader.count = k_dim
+    a_reader.stride_bytes = a_stride
+    a_reader.transpose_enable = a_transpose
+    a_reader.row_count = 4
+    a_reader.ub_read_ready = mux(restore_state, 0, ub_read_a_ready)
+    a_reader.ub_read_data = ub_read_a_data
+    a_reader.source_ready = a_fifo.sink_ready
+
+    b_reader.start = kick_pulse
+    b_reader.base = b_base
+    b_reader.count = k_dim
+    b_reader.stride_bytes = b_stride
+    b_reader.transpose_enable = b_transpose
+    b_reader.row_count = 4
+    b_reader.ub_read_ready = ub_read_b_ready
+    b_reader.ub_read_data = ub_read_b_data
+    b_reader.source_ready = b_fifo.sink_ready
+
+    a_fifo.sink_valid = a_reader.source_valid
+    a_fifo.sink_data = a_reader.source_data
+    a_fifo.source_ready = zs_a.sink_ready
+    b_fifo.sink_valid = b_reader.source_valid
+    b_fifo.sink_data = b_reader.source_data
+    b_fifo.source_ready = zs_b.sink_ready
+
+    zs_a.enable = zs_enable_a
+    zs_a.sink_valid = a_fifo.source_valid
+    zs_a.sink_data = a_fifo.source_data
+    zs_a.source_ready = feeder.sink_a_ready
+    zs_b.enable = zs_enable_b
+    zs_b.sink_valid = b_fifo.source_valid
+    zs_b.sink_data = b_fifo.source_data
+    zs_b.source_ready = feeder.sink_b_ready
+
+    feeder.start = kick_pulse
+    feeder.k_dim = k_dim
+    feeder.b_format = mux(mode == 4, 1, mux(mode == 5, 2, 0))
+    feeder.sink_a_valid = zs_a.source_valid
+    feeder.sink_a_data = zs_a.source_data
+    feeder.sink_b_valid = zs_b.source_valid
+    feeder.sink_b_data = zs_b.source_data
+
+    mxu.clear = feeder.clear_pulse
+    mxu.input0 = feeder.a0
+    mxu.input1 = feeder.a1
+    mxu.input2 = feeder.a2
+    mxu.input3 = feeder.a3
+    mxu.weight0 = feeder.b0
+    mxu.weight1 = feeder.b1
+    mxu.weight2 = feeder.b2
+    mxu.weight3 = feeder.b3
+
+    microseq.start = compute_state & compute_armed
+    microseq.k_dim = k_dim
+    microseq.feeder_done = feeder.done
+
+    mxu_results : vec<16,s32> = [
+        mxu.output00, mxu.output01, mxu.output02, mxu.output03,
+        mxu.output10, mxu.output11, mxu.output12, mxu.output13,
+        mxu.output20, mxu.output21, mxu.output22, mxu.output23,
+        mxu.output30, mxu.output31, mxu.output32, mxu.output33
+    ]
+    selected_mxu : s32 = mxu_results[flat_index]
+    accumulator.read_address = mux(spill_state, acc_io_index, flat_index)
+    acc_old : s32 = accumulator.read_data
+    acc_start : s32 = mux(accum_enable, acc_old, 0)
+    acc_sum : s32 = truncate<32>(acc_start + selected_mxu)
+
+    requant.enable = rq_enable
+    requant.scale = rq_scale
+    requant.shift = truncate<6>(rq_shift)
+    requant.zero_point = rq_zero
+    requant.value = acc_sum
+
+    restore_commit : bit = restore_state & ub_read_a_ready
+    clear_commit : bit = clear_state
+    write_commit : bit = write_state & ub_write_ready
+    accumulator.write_enable = restore_commit | clear_commit | write_commit
+    accumulator.write_address = mux(
+        clear_commit,
+        clear_index,
+        mux(restore_commit, acc_io_index, flat_index)
+    )
+    accumulator.write_data = mux(
+        clear_commit,
+        0,
+        mux(restore_commit, bitcast<s32>(ub_read_a_data), acc_sum)
+    )
+    accumulator.write_mask = 15
+
+    restore_last : bit = acc_io_index == 15
+    clear_last : bit = clear_index == 15
+    output_last : bit = (out_row == 3) & (out_col == 3)
+    output_row_end : bit = out_col == 3
+    spill_last : bit = acc_io_index == 15
+    compute_done : bit = compute_state & microseq.done
+
+    enter_compute : bit =
+        (idle & start & (~restore_enable) & (~acc_clear) & do_compute) |
+        (restore_state & restore_last & (~acc_clear) & do_compute) |
+        (clear_state & clear_last & do_compute)
+    compute_armed <- mux(
+        ~compute_state,
+        enter_compute,
+        mux(compute_armed, 0, compute_armed)
+    )
+    out_row <- mux(
+        idle & start,
+        0,
+        mux(
+            compute_done,
+            0,
+            mux(write_commit & (~output_last) & output_row_end,
+                truncate<2>(out_row + 1), out_row)
+        )
+    )
+    out_col <- mux(
+        idle & start,
+        0,
+        mux(
+            compute_done,
+            0,
+            mux(write_commit & (~output_last),
+                mux(output_row_end, 0, truncate<2>(out_col + 1)), out_col)
+        )
+    )
+    clear_index <- mux(
+        idle & start,
+        0,
+        mux(clear_state & (~clear_last), truncate<4>(clear_index + 1), clear_index)
+    )
+    acc_io_index <- mux(
+        idle & start,
+        0,
+        mux(
+            restore_state & restore_last & (acc_clear | do_compute | spill_enable),
+            0,
+            mux(
+                restore_state & (~restore_last) & ub_read_a_ready,
+                truncate<4>(acc_io_index + 1),
+                mux(
+                    clear_state & clear_last & (~do_compute) & spill_enable,
+                    0,
+                    mux(
+                        write_commit & output_last & spill_enable,
+                        0,
+                        mux(spill_state & ub_write_ready & (~spill_last),
+                            truncate<4>(acc_io_index + 1), acc_io_index)
+                    )
+                )
+            )
+        )
+    )
+
+    nz_a : u3 = mux(zs_enable_a, zs_a.nz_count, 4)
+    nz_b : u3 = mux(zs_enable_b, zs_b.nz_count, 4)
+    active_step : u32 = truncate<32>(extend<32>(nz_a) * extend<32>(nz_b))
+    skipped_step : u32 = 16 - active_step
+    count_step : bit = feeder.step_valid & (zs_enable_a | zs_enable_b)
+    zs_steps_state <- mux(kick_pulse, 0,
+        mux(count_step, truncate<32>(zs_steps_state + 1), zs_steps_state))
+    zs_total_state <- mux(kick_pulse, 0,
+        mux(count_step, truncate<32>(zs_total_state + 16), zs_total_state))
+    zs_active_state <- mux(kick_pulse, 0,
+        mux(count_step, truncate<32>(zs_active_state + active_step), zs_active_state))
+    zs_skipped_state <- mux(kick_pulse, 0,
+        mux(count_step, truncate<32>(zs_skipped_state + skipped_step), zs_skipped_state))
+
+    busy = ~idle
+    done = done_state
+    zs_steps = zs_steps_state
+    zs_total_macs = zs_total_state
+    zs_active_macs = zs_active_state
+    zs_skipped_macs = zs_skipped_state
+    ub_read_a_valid = mux(restore_state, 1, a_reader.ub_read_valid)
+    ub_read_a_addr = mux(restore_state, acc_address, a_reader.ub_read_addr)
+    ub_read_b_valid = b_reader.ub_read_valid
+    ub_read_b_addr = b_reader.ub_read_addr
+    ub_write_valid = write_state | spill_state
+    ub_write_addr = mux(spill_state, acc_address, c_address)
+    ub_write_data = mux(
+        spill_state,
+        bitcast<bits<32>>(accumulator.read_data),
+        bitcast<bits<32>>(requant.result)
+    )
+    ub_write_mask = 15
+
+    fsm phase : ZtpuUbMxuI8Phase = Idle {
+        Idle {
+            priority {
+                when start & restore_enable -> Restore {}
+                when start & acc_clear -> Clear {}
+                when start & do_compute -> Compute {}
+                when start & spill_enable -> Spill {}
+                when start -> Done {}
+            }
+        }
+        Restore {
+            priority {
+                when restore_last & acc_clear -> Clear {}
+                when restore_last & do_compute -> Compute {}
+                when restore_last & spill_enable -> Spill {}
+                when restore_last -> Done {}
+            }
+        }
+        Clear {
+            priority {
+                when clear_last & do_compute -> Compute {}
+                when clear_last & spill_enable -> Spill {}
+                when clear_last -> Done {}
+            }
+        }
+        Compute { when microseq.done -> Write {} }
+        Write {
+            priority {
+                when write_commit & output_last & spill_enable -> Spill {}
+                when write_commit & output_last -> Done {}
+            }
+        }
+        Spill { when ub_write_ready & spill_last -> Done {} }
+        Done { -> Idle {} }
+    }
+}
+
+// Compile-time specialization of the exact Q16 path. TILE is a power of two;
+// concrete wrappers expose the supported 2x2 and 4x4 interfaces. Packed-int8
+// modes use the module above.
+module ZtpuUbMxuComputeQ16<
+    TILE=2,
+    OIW=index_width(TILE),
+    ACC_DEPTH=TILE*TILE,
+    AIW=index_width(ACC_DEPTH),
+    LAST=TILE-1
+>
+where TILE >= 2 && is_power_of_two(TILE) && OIW == floor_log2(TILE) &&
+      ACC_DEPTH == TILE*TILE && AIW == floor_log2(ACC_DEPTH) {
+    clock clk reset rst
+
+    in start : bit
+    in a_base : uint<64>
+    in b_base : uint<64>
+    in c_base : uint<64>
+    in acc_base : uint<64>
+    in a_stride : uint<64>
+    in b_stride : uint<64>
+    in a_transpose : bit
+    in b_transpose : bit
+    in k_dim : u16
+    in mode : u3
+    in accum_enable : bit
+    in acc_clear : bit
+    in spill_enable : bit
+    in restore_enable : bit
+
+    out busy, done : bit
+
+    out ub_read_a_valid : bit
+    in ub_read_a_ready : bit
+    out ub_read_a_addr : uint<64>
+    in ub_read_a_data : bits<32>
+
+    out ub_read_b_valid : bit
+    in ub_read_b_ready : bit
+    out ub_read_b_addr : uint<64>
+    in ub_read_b_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    reg out_row : uint<OIW> = 0
+    reg out_col : uint<OIW> = 0
+    reg clear_index : uint<AIW> = 0
+    reg acc_io_index : uint<AIW> = 0
+    reg q16_k : u16 = 0
+    reg q16_acc : s32 = 0
+
+    idle : bit = phase == ZtpuUbMxuQ16Phase.Idle
+    restore_state : bit = phase == ZtpuUbMxuQ16Phase.Restore
+    clear_state : bit = phase == ZtpuUbMxuQ16Phase.Clear
+    spill_state : bit = phase == ZtpuUbMxuQ16Phase.Spill
+    done_state : bit = phase == ZtpuUbMxuQ16Phase.Done
+    q16_init_state : bit = phase == ZtpuUbMxuQ16Phase.Q16Init
+    q16_run_state : bit = phase == ZtpuUbMxuQ16Phase.Q16Run
+
+    mode_valid : bit = mode <= 3
+    q16_mode : bit = mode == 3
+    do_compute : bit = (k_dim != 0) & mode_valid & q16_mode
+
+    flat_index : uint<AIW> = truncate<AIW>(
+        (extend<AIW>(out_row) * TILE) + extend<AIW>(out_col)
+    )
+    c_offset : uint<64> = extend<64>(flat_index) << 2
+    c_address : uint<64> = truncate<64>(c_base + c_offset)
+    acc_offset : uint<64> = extend<64>(acc_io_index) << 2
+    acc_address : uint<64> = truncate<64>(acc_base + acc_offset)
+
+    effective_a_stride : uint<64> = mux(a_stride == 0, 4, a_stride)
+    effective_b_stride : uint<64> = mux(b_stride == 0, 4, b_stride)
+    a_row : u16 = mux(a_transpose, q16_k, extend<16>(out_row))
+    a_col : u16 = mux(a_transpose, extend<16>(out_row), q16_k)
+    b_row : u16 = mux(b_transpose, extend<16>(out_col), q16_k)
+    b_col : u16 = mux(b_transpose, q16_k, extend<16>(out_col))
+    a_address : uint<64> = truncate<64>(
+        a_base + (extend<64>(a_row) * effective_a_stride) + (extend<64>(a_col) << 2)
+    )
+    b_address : uint<64> = truncate<64>(
+        b_base + (extend<64>(b_row) * effective_b_stride) + (extend<64>(b_col) << 2)
+    )
+
+    product : s64 = bitcast<s32>(ub_read_a_data) * bitcast<s32>(ub_read_b_data)
+    rounded_product : s64 = truncate<64>(product + 32768)
+    // Signed right shift is arithmetic, so the Q16 scale is removed exactly.
+    shifted_product : s64 = rounded_product >> 16
+    saturated_product : s32 = ztpu_sat_s32_from_s64(shifted_product)
+    accumulated_full : s65 = truncate<65>(
+        extend<65>(q16_acc) + extend<65>(saturated_product)
+    )
+    accumulated_next : s32 = ztpu_sat_s32_from_s65(accumulated_full)
+
+    inst accumulator : ZtpuAccumulatorNx32<D=ACC_DEPTH,IW=AIW>
+    accumulator.read_address = mux(spill_state, acc_io_index, flat_index)
+
+    read_pair_ready : bit = ub_read_a_ready & ub_read_b_ready
+    last_k : bit = q16_k == truncate<16>(k_dim - 1)
+    q16_commit : bit = q16_run_state & read_pair_ready & last_k & ub_write_ready
+    restore_commit : bit = restore_state & ub_read_a_ready
+    clear_commit : bit = clear_state
+
+    accumulator.write_enable = clear_commit | restore_commit | q16_commit
+    accumulator.write_address = mux(
+        clear_commit,
+        clear_index,
+        mux(restore_commit, acc_io_index, flat_index)
+    )
+    accumulator.write_data = mux(
+        clear_commit,
+        0,
+        mux(restore_commit, bitcast<s32>(ub_read_a_data), accumulated_next)
+    )
+    accumulator.write_mask = 15
+
+    start_restore : bit = idle & start & restore_enable
+    start_clear : bit = idle & start & (~restore_enable) & acc_clear
+    start_compute : bit = idle & start & (~restore_enable) & (~acc_clear) & do_compute
+    start_spill : bit = idle & start & (~restore_enable) & (~acc_clear) & (~do_compute) & spill_enable
+
+    restore_last : bit = acc_io_index == (ACC_DEPTH - 1)
+    clear_last : bit = clear_index == (ACC_DEPTH - 1)
+    output_last : bit = (out_row == LAST) & (out_col == LAST)
+    output_row_end : bit = out_col == LAST
+    spill_last : bit = acc_io_index == (ACC_DEPTH - 1)
+
+    out_row <- mux(
+        idle & start,
+        0,
+        mux(q16_commit & (~output_last) & output_row_end,
+            truncate<OIW>(out_row + 1), out_row)
+    )
+    out_col <- mux(
+        idle & start,
+        0,
+        mux(q16_commit & (~output_last),
+            mux(output_row_end, 0, truncate<OIW>(out_col + 1)), out_col)
+    )
+    clear_index <- mux(
+        idle & start,
+        0,
+        mux(clear_state & (~clear_last), truncate<AIW>(clear_index + 1), clear_index)
+    )
+    acc_io_index <- mux(
+        idle & start,
+        0,
+        mux(
+            restore_state & restore_last & (acc_clear | do_compute | spill_enable),
+            0,
+            mux(
+                restore_state & (~restore_last) & ub_read_a_ready,
+                truncate<AIW>(acc_io_index + 1),
+                mux(
+                    clear_state & clear_last & (~do_compute) & spill_enable,
+                    0,
+                    mux(
+                        q16_commit & output_last & spill_enable,
+                        0,
+                        mux(spill_state & ub_write_ready & (~spill_last),
+                            truncate<AIW>(acc_io_index + 1), acc_io_index)
+                    )
+                )
+            )
+        )
+    )
+    q16_k <- mux(
+        q16_init_state,
+        0,
+        mux(q16_run_state & read_pair_ready & (~last_k),
+            truncate<16>(q16_k + 1), q16_k)
+    )
+    q16_acc <- mux(
+        q16_init_state,
+        mux(accum_enable, accumulator.read_data, 0),
+        mux(q16_run_state & read_pair_ready & (~last_k), accumulated_next, q16_acc)
+    )
+
+    busy = ~idle
+    done = done_state
+    ub_read_a_valid = restore_state | q16_run_state
+    ub_read_a_addr = mux(restore_state, acc_address, a_address)
+    ub_read_b_valid = q16_run_state
+    ub_read_b_addr = b_address
+    ub_write_valid = mux(
+        q16_run_state,
+        read_pair_ready & last_k,
+        spill_state
+    )
+    ub_write_addr = mux(spill_state, acc_address, c_address)
+    ub_write_data = mux(
+        spill_state,
+        bitcast<bits<32>>(accumulator.read_data),
+        bitcast<bits<32>>(accumulated_next)
+    )
+    ub_write_mask = 15
+
+    fsm phase : ZtpuUbMxuQ16Phase = Idle {
+        Idle {
+            priority {
+                when start_restore -> Restore {}
+                when start_clear -> Clear {}
+                when start_compute -> Q16Init {}
+                when start_spill -> Spill {}
+                when start -> Done {}
+            }
+        }
+        Restore {
+            priority {
+                when restore_last & acc_clear -> Clear {}
+                when restore_last & do_compute -> Q16Init {}
+                when restore_last & spill_enable -> Spill {}
+                when restore_last -> Done {}
+            }
+        }
+        Clear {
+            priority {
+                when clear_last & do_compute -> Q16Init {}
+                when clear_last & spill_enable -> Spill {}
+                when clear_last -> Done {}
+            }
+        }
+        Q16Init { -> Q16Run {} }
+        Q16Run {
+            priority {
+                when q16_commit & output_last & spill_enable -> Spill {}
+                when q16_commit & output_last -> Done {}
+                when q16_commit -> Q16Init {}
+            }
+        }
+        Spill { when ub_write_ready & spill_last -> Done {} }
+        Done { -> Idle {} }
+    }
+}
+
+module ZtpuUbMxuCompute2x2Q16 {
+    clock clk reset rst
+
+    in start : bit
+    in a_base, b_base, c_base, acc_base : uint<64>
+    in a_stride, b_stride : uint<64>
+    in a_transpose, b_transpose : bit
+    in k_dim : u16
+    in mode : u3
+    in accum_enable, acc_clear, spill_enable, restore_enable : bit
+    out busy, done : bit
+    out ub_read_a_valid : bit
+    in ub_read_a_ready : bit
+    out ub_read_a_addr : uint<64>
+    in ub_read_a_data : bits<32>
+    out ub_read_b_valid : bit
+    in ub_read_b_ready : bit
+    out ub_read_b_addr : uint<64>
+    in ub_read_b_data : bits<32>
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    inst core : ZtpuUbMxuComputeQ16<
+        TILE=2, OIW=1, ACC_DEPTH=4, AIW=2, LAST=1
+    > {
+        start a_base b_base c_base acc_base a_stride b_stride
+        a_transpose b_transpose k_dim mode accum_enable acc_clear
+        spill_enable restore_enable ub_read_a_ready ub_read_a_data
+        ub_read_b_ready ub_read_b_data ub_write_ready
+    }
+    busy = core.busy
+    done = core.done
+    ub_read_a_valid = core.ub_read_a_valid
+    ub_read_a_addr = core.ub_read_a_addr
+    ub_read_b_valid = core.ub_read_b_valid
+    ub_read_b_addr = core.ub_read_b_addr
+    ub_write_valid = core.ub_write_valid
+    ub_write_addr = core.ub_write_addr
+    ub_write_data = core.ub_write_data
+    ub_write_mask = core.ub_write_mask
+}
+
+module ZtpuUbMxuCompute4x4Q16 {
+    clock clk reset rst
+
+    in start : bit
+    in a_base, b_base, c_base, acc_base : uint<64>
+    in a_stride, b_stride : uint<64>
+    in a_transpose, b_transpose : bit
+    in k_dim : u16
+    in mode : u3
+    in accum_enable, acc_clear, spill_enable, restore_enable : bit
+    out busy, done : bit
+    out ub_read_a_valid : bit
+    in ub_read_a_ready : bit
+    out ub_read_a_addr : uint<64>
+    in ub_read_a_data : bits<32>
+    out ub_read_b_valid : bit
+    in ub_read_b_ready : bit
+    out ub_read_b_addr : uint<64>
+    in ub_read_b_data : bits<32>
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    inst core : ZtpuUbMxuComputeQ16<
+        TILE=4, OIW=2, ACC_DEPTH=16, AIW=4, LAST=3
+    > {
+        start a_base b_base c_base acc_base a_stride b_stride
+        a_transpose b_transpose k_dim mode accum_enable acc_clear
+        spill_enable restore_enable ub_read_a_ready ub_read_a_data
+        ub_read_b_ready ub_read_b_data ub_write_ready
+    }
+    busy = core.busy
+    done = core.done
+    ub_read_a_valid = core.ub_read_a_valid
+    ub_read_a_addr = core.ub_read_a_addr
+    ub_read_b_valid = core.ub_read_b_valid
+    ub_read_b_addr = core.ub_read_b_addr
+    ub_write_valid = core.ub_write_valid
+    ub_write_addr = core.ub_write_addr
+    ub_write_data = core.ub_write_data
+    ub_write_mask = core.ub_write_mask
+}

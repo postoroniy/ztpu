@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+fn relu_s16(value : s16) -> s16 {
+    mux(value > 0, value, 0)
+}
+
+fn clip_sigmoid_s16(value : s16) -> s16 {
+    mux(value < -4, -4, mux(value > 4, 4, value))
+}
+
+fn sigmoid_clipped_s16(value : s16) -> s16 {
+    mux(
+        value <= -4,
+        0,
+        mux(
+            value < -2,
+            truncate<16>((value + 4) << 5),
+            mux(
+                value < 2,
+                truncate<16>(((value + 2) << 5) + 64),
+                mux(value < 4, truncate<16>(((value - 2) << 5) + 192), 255)
+            )
+        )
+    )
+}
+
+fn sigmoid_s16(value : s16) -> s16 {
+    sigmoid_clipped_s16(clip_sigmoid_s16(value))
+}
+
+fn activation_s16(value : s16, activation_type : bits<2>) -> s16 {
+    switch activation_type {
+        0 => value
+        1 => relu_s16(value)
+        2 => sigmoid_s16(value)
+        else => 0
+    }
+}
+
+module ZtpuActivationQ16x4 {
+    clock clk
+    reset rst
+
+    in input0, input1, input2, input3 : s16
+    in activation_type : bits<2>
+    out output0, output1, output2, output3 : s16
+
+    inputs : vec<4,s16> = [input0, input1, input2, input3]
+    reg results : vec<4,s16> = generate(i in 0..4) 0
+
+    results <- generate(i in 0..4) activation_s16(inputs[i], activation_type)
+
+    output0 = results[0]
+    output1 = results[1]
+    output2 = results[2]
+    output3 = results[3]
+}
+
+module ZtpuBiasAccumulateQ16x4 {
+    clock clk
+    reset rst
+
+    in input0, input1, input2, input3 : s16
+    in bias0, bias1, bias2, bias3 : s16
+    in enable_accumulate : bit
+    out output0, output1, output2, output3 : s16
+
+    inputs : vec<4,s16> = [input0, input1, input2, input3]
+    biases : vec<4,s16> = [bias0, bias1, bias2, bias3]
+    reg accumulators : vec<4,s16> = generate(i in 0..4) 0
+    next_values : vec<4,s16> = generate(i in 0..4) {
+        mux(enable_accumulate,
+            truncate<16>(accumulators[i] + inputs[i]), inputs[i])
+    }
+    outputs : vec<4,s16> = generate(i in 0..4) {
+        truncate<16>(next_values[i] + biases[i])
+    }
+
+    accumulators <- next_values
+
+    output0 = outputs[0]
+    output1 = outputs[1]
+    output2 = outputs[2]
+    output3 = outputs[3]
+}
+
+module ZtpuAccRequantCore<OUT=16> {
+    in enable : bit
+    in scale : s32
+    in shift : u6
+    in zero_point : sint<OUT>
+    in value : s32
+    out result : sint<OUT>
+
+    product : s64 = value * scale
+    product_wide : s66 = extend<66>(product)
+    one : s66 = 1
+    shift_m1 : u6 = shift - 1
+    round_add : s66 = mux(shift == 0, 0, one << shift_m1)
+    rounded : s66 = truncate<66>(product_wide + round_add)
+    shifted : s66 = rounded >> shift
+    biased : s66 = truncate<66>(shifted + extend<66>(zero_point))
+    maximum : s66 = truncate<66>((one << (OUT - 1)) - 1)
+    minimum : s66 = truncate<66>(0 - (one << (OUT - 1)))
+    clamped : s66 = mux(
+        biased > maximum,
+        maximum,
+        mux(biased < minimum, minimum, biased)
+    )
+    result = mux(enable, truncate<OUT>(clamped), truncate<OUT>(value))
+}
+
+module ZtpuAccRequant8 {
+    in enable : bit
+    in scale : s32
+    in shift : u6
+    in zero_point : s8
+    in value : s32
+    out result : s8
+    inst core : ZtpuAccRequantCore<OUT=8> { enable scale shift zero_point value }
+    result = core.result
+}
+
+module ZtpuAccRequant16 {
+    in enable : bit
+    in scale : s32
+    in shift : u6
+    in zero_point : s16
+    in value : s32
+    out result : s16
+    inst core : ZtpuAccRequantCore<OUT=16> { enable scale shift zero_point value }
+    result = core.result
+}
+
+module ZtpuAccRequant32 {
+    in enable : bit
+    in scale : s32
+    in shift : u6
+    in zero_point : s32
+    in value : s32
+    out result : s32
+    inst core : ZtpuAccRequantCore<OUT=32> { enable scale shift zero_point value }
+    result = core.result
+}

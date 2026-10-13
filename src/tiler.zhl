@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+struct ZtpuAddress64 {
+    addr : u64
+}
+
+// Cycle-exact concrete profile used by the original top: up to 256x256.
+module ZtpuTiler64x256 {
+    clock clk reset rst
+    in start : bit
+    in base_addr, row_stride, col_stride : u64
+    in rows, cols : u9
+    out stream : rv<ZtpuAddress64>
+    out done : bit
+
+    reg row : u8 = 0
+    reg col : u8 = 0
+    reg active : bit = 0
+
+    row_last : u8 = truncate<8>(rows) - 1
+    col_last : u8 = truncate<8>(cols) - 1
+    stream.valid = active
+    stream.payload = ZtpuAddress64 {
+        addr = truncate<64>(
+            base_addr + extend<64>(row) * row_stride +
+            extend<64>(col) * col_stride
+        )
+    }
+    last : bit = active & (row == row_last) & (col == col_last)
+    done = last
+
+    priority {
+        when start {
+            row <- 0
+            col <- 0
+            active <- 1
+        }
+        when active & stream.ready {
+            active <- ~last
+            col <- mux(
+                last, col,
+                mux(col == col_last, 0, truncate<8>(col + 1))
+            )
+            row <- mux(
+                last, row,
+                mux(col == col_last, truncate<8>(row + 1), row)
+            )
+        }
+    }
+}
+
+module ZtpuTilerFlat64x256 {
+    clock clk reset rst
+    in start : bit
+    in base_addr, row_stride, col_stride : u64
+    in rows, cols : u9
+    in stream_ready : bit
+    out stream_valid : bit
+    out stream_addr : u64
+    out done : bit
+
+    core : ZtpuTiler64x256 { start base_addr row_stride col_stride rows cols }
+    core.stream.ready = stream_ready
+    stream_valid = core.stream.valid
+    stream_addr = core.stream.payload.addr
+    done = core.done
+}

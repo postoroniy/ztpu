@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+// First-fault DMA fence record used by the host-visible configuration state.
+module ZtpuDmaFenceFaultLatch64 {
+    clock clk reset rst
+
+    in fault : bit
+    in fault_write : bit
+    in fault_master : u4
+    in fault_addr : uint<64>
+    in fault_len : u8
+    in fault_size : u3
+    in clear_valid, clear_overflow : bit
+
+    out reg valid : bit = 0
+    out reg overflow : bit = 0
+    out reg sticky_write : bit = 0
+    out reg sticky_master : u4 = 0
+    out reg sticky_addr : uint<64> = 0
+    out reg sticky_len : u8 = 0
+    out reg sticky_size : u3 = 0
+
+    capture : bit = fault & (~valid)
+    valid <- mux(fault, 1, mux(clear_valid, 0, valid))
+    overflow <- mux(
+        fault,
+        valid,
+        mux(clear_valid | clear_overflow, 0, overflow)
+    )
+    sticky_write <- mux(capture, fault_write, sticky_write)
+    sticky_master <- mux(capture, fault_master, sticky_master)
+    sticky_addr <- mux(capture, fault_addr, sticky_addr)
+    sticky_len <- mux(capture, fault_len, sticky_len)
+    sticky_size <- mux(capture, fault_size, sticky_size)
+
+    assert overflow_implies_valid @ clk { (~overflow) | valid }
+    cover captures_first_fault @ clk { valid & (~overflow) }
+    cover records_repeated_fault @ clk { overflow }
+}

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_stream_v1",
+  "source_language": "zlang",
+  "reader_top": "ZtpuUbStreamReader32",
+  "writer_top": "ZtpuUbStreamWriter32",
+  "data_width": 32,
+  "address_width": 64,
+  "count_width": 16,
+  "reader_modes": ["linear", "transpose_gather_4x8"],
+  "zero_stride_bytes": 4,
+  "writer_stride_bytes": 4,
+  "timing": "cycle_exact"
+}

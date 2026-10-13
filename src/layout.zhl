@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.layout_types
+
+fn ztpu_layout_term(index : u6, stride : u64) -> u64 {
+    truncate<64>(extend<64>(index) * stride)
+}
+
+fn ztpu_layout_address(
+    layout : u2,
+    base : u64,
+    n : u2,
+    c : u6,
+    h : u6,
+    w : u6,
+    stride_n : u64,
+    stride_c : u64,
+    stride_h : u64,
+    stride_w : u64,
+    stride_cb : u64
+) -> u64 {
+    switch layout {
+        0 => truncate<64>(
+            base + truncate<64>(extend<64>(n) * stride_n) +
+            ztpu_layout_term(c, stride_c) + ztpu_layout_term(h, stride_h) +
+            ztpu_layout_term(w, stride_w)
+        )
+        1 => truncate<64>(
+            base + truncate<64>(extend<64>(n) * stride_n) +
+            ztpu_layout_term(h, stride_h) + ztpu_layout_term(w, stride_w) +
+            ztpu_layout_term(c, stride_c)
+        )
+        2 => truncate<64>(
+            base + truncate<64>(extend<64>(n) * stride_n) +
+            ztpu_layout_term(c >> 2, stride_c) +
+            ztpu_layout_term(h, stride_h) + ztpu_layout_term(w, stride_w) +
+            truncate<64>(extend<64>(bitcast<u2>(c[1:0])) * stride_cb)
+        )
+        else => base
+    }
+}
+
+// Cycle-exact concrete profile used by the original top: N<=4, C/H/W<=64,
+// and NCHWc block size 4. Strides carry layout semantics, so NCHW and NHWC
+// intentionally differ only in their documented term order.
+module ZtpuLayoutTranspose64 {
+    clock clk reset rst
+    in start : bit
+    in layout_in, layout_out : u2
+    in base_in, base_out : u64
+    in in_stride_n, in_stride_c, in_stride_h : u64
+    in in_stride_w, in_stride_cb : u64
+    in out_stride_n, out_stride_c, out_stride_h : u64
+    in out_stride_w, out_stride_cb : u64
+    in n_dim : u3
+    in c_dim, h_dim, w_dim : u7
+    out stream : rv<ZtpuLayoutAddressPair64>
+    out done : bit
+    out reg error : bit = 0
+
+    reg n_index : u2 = 0
+    reg c_index : u6 = 0
+    reg h_index : u6 = 0
+    reg w_index : u6 = 0
+    reg active : bit = 0
+
+    dimensions_valid : bit = (n_dim != 0) & (c_dim != 0) &
+        (h_dim != 0) & (w_dim != 0)
+    blocked_layout : bit = (layout_in == 2) | (layout_out == 2)
+    channel_aligned : bit = c_dim[1:0] == 0
+    start_error : bit = (~dimensions_valid) |
+        (blocked_layout & (~channel_aligned))
+
+    n_last : u2 = truncate<2>(n_dim) - 1
+    c_last : u6 = truncate<6>(c_dim) - 1
+    h_last : u6 = truncate<6>(h_dim) - 1
+    w_last : u6 = truncate<6>(w_dim) - 1
+    last : bit = active & (n_index == n_last) & (c_index == c_last) &
+        (h_index == h_last) & (w_index == w_last)
+
+    stream.valid = active
+    stream.payload = ZtpuLayoutAddressPair64 {
+        in_addr = ztpu_layout_address(
+            layout_in, base_in, n_index, c_index, h_index, w_index,
+            in_stride_n, in_stride_c, in_stride_h, in_stride_w, in_stride_cb
+        )
+        out_addr = ztpu_layout_address(
+            layout_out, base_out, n_index, c_index, h_index, w_index,
+            out_stride_n, out_stride_c, out_stride_h, out_stride_w,
+            out_stride_cb
+        )
+    }
+    done = last
+
+    priority {
+        when start {
+            n_index <- 0
+            c_index <- 0
+            h_index <- 0
+            w_index <- 0
+            active <- ~start_error
+            error <- start_error
+        }
+        when active & stream.ready {
+            active <- ~last
+            c_index <- mux(
+                last, c_index,
+                mux(c_index == c_last, 0, truncate<6>(c_index + 1))
+            )
+            w_index <- mux(
+                last, w_index,
+                mux(c_index != c_last, w_index,
+                    mux(w_index == w_last, 0, truncate<6>(w_index + 1)))
+            )
+            h_index <- mux(
+                last, h_index,
+                mux((c_index != c_last) | (w_index != w_last), h_index,
+                    mux(h_index == h_last, 0, truncate<6>(h_index + 1)))
+            )
+            n_index <- mux(
+                last, n_index,
+                mux((c_index == c_last) & (w_index == w_last) &
+                    (h_index == h_last), truncate<2>(n_index + 1), n_index)
+            )
+        }
+    }
+}
+
+module ZtpuLayoutTransposeFlat64 {
+    clock clk reset rst
+    in start : bit
+    in layout_in, layout_out : u2
+    in base_in, base_out : u64
+    in in_stride_n, in_stride_c, in_stride_h : u64
+    in in_stride_w, in_stride_cb : u64
+    in out_stride_n, out_stride_c, out_stride_h : u64
+    in out_stride_w, out_stride_cb : u64
+    in n_dim : u3
+    in c_dim, h_dim, w_dim : u7
+    in stream_ready : bit
+    out stream_valid : bit
+    out stream_in_addr, stream_out_addr : u64
+    out done, error : bit
+
+    core : ZtpuLayoutTranspose64 {
+        start layout_in layout_out base_in base_out in_stride_n in_stride_c
+        in_stride_h in_stride_w in_stride_cb out_stride_n out_stride_c
+        out_stride_h out_stride_w out_stride_cb n_dim c_dim h_dim w_dim
+    }
+    core.stream.ready = stream_ready
+    stream_valid = core.stream.valid
+    stream_in_addr = core.stream.payload.in_addr
+    stream_out_addr = core.stream.payload.out_addr
+    done = core.done
+    error = core.error
+}

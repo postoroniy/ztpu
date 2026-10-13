@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "contract": "ztpu_fxp_math_q16_v1",
+  "source_language": "zlang",
+  "fixed_point": "Q16.16",
+  "newton_raphson_iterations": 2,
+  "modules": {
+    "reciprocal": {
+      "top": "ZtpuReciprocalNr2Q16",
+      "seed_table": "recip_05_1",
+      "zero_input_substitute": 1
+    },
+    "reciprocal_square_root": {
+      "top": "ZtpuRsqrtNr2Q16",
+      "seed_table": "rsqrt_05_1",
+      "zero_input_substitute": 1
+    }
+  },
+  "normalization_interval": "[0.5,1.0)",
+  "timing": "cycle_exact"
+}

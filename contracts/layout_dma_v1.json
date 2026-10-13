@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "contract": "ztpu_layout_dma_v1",
+  "source_language": "zlang",
+  "tops": [
+    "ZtpuLayoutDmaControl64x32",
+    "ZtpuLayoutDmaCopy64x32",
+    "ZtpuLayoutDmaAxi4Master64x32"
+  ],
+  "address_width": 64,
+  "data_width": 32,
+  "transfer": "one_aligned_word_per_layout_address_pair",
+  "compatibility_axi_profile": "idless_single_outstanding",
+  "full_axi4_profile": {
+    "id": 0,
+    "burst": "INCR",
+    "write_strobe": "all_lanes",
+    "outstanding": 1,
+    "response_id_mismatch": "SLVERR"
+  },
+  "timing": "cycle_exact",
+  "verification": "zlang_native_vs_verilator_and_direct_protocol_tests"
+}

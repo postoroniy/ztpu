@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+module ZtpuStreamFifo32x4 {
+    clock clk
+    reset rst
+
+    in sink_valid : bit
+    in sink_data : bits<32>
+    out sink_ready : bit
+
+    out source_valid : bit
+    out source_data : bits<32>
+    in source_ready : bit
+
+    out level : u3
+
+    fifo storage : fifo<bits<32>,4>
+    storage.data = sink_data
+    storage.push = sink_valid & (storage.count != 4)
+    storage.pop = storage.valid & source_ready
+
+    sink_ready = storage.count != 4
+    source_valid = storage.valid
+    source_data = storage.front
+    level = storage.count
+}
+
+module ZtpuStreamFifo32x8 {
+    clock clk
+    reset rst
+
+    in sink_valid : bit
+    in sink_data : bits<32>
+    out sink_ready : bit
+
+    out source_valid : bit
+    out source_data : bits<32>
+    in source_ready : bit
+
+    out level : u4
+
+    fifo storage : fifo<bits<32>,8>
+    storage.data = sink_data
+    storage.push = sink_valid & (storage.count != 8)
+    storage.pop = storage.valid & source_ready
+
+    sink_ready = storage.count != 8
+    source_valid = storage.valid
+    source_data = storage.front
+    level = storage.count
+}
+
+struct ZtpuCompletion {
+    tag : bits<8>
+    opcode : bits<4>
+    status : bits<4>
+    error_code : bits<8>
+}
+
+module ZtpuCompletionQueue8 {
+    clock clk
+    reset rst
+
+    in enable : bit
+    in clear : bit
+    in push_valid : bit
+    out push_ready : bit
+    in push_tag : bits<8>
+    in push_opcode : bits<4>
+    in push_status : bits<4>
+    in push_error : bits<8>
+
+    out head_valid : bit
+    out head_tag : bits<8>
+    out head_opcode : bits<4>
+    out head_status : bits<4>
+    out head_error : bits<8>
+    in pop : bit
+
+    out reg count : u4 = 0
+    out reg overflow : bit = 0
+
+    reg entries : vec<8,ZtpuCompletion> = generate(i in 0..8) ZtpuCompletion {
+        tag = 0 opcode = 0 status = 0 error_code = 0
+    }
+    reg head_index : u3 = 0
+    reg tail_index : u3 = 0
+
+    empty : bit = count == 0
+    full : bit = count == 8
+    push_fire : bit = enable & push_valid & (~full)
+    pop_fire : bit = enable & pop & (~empty)
+    overrun : bit = enable & push_valid & full
+    next_head : u3 = truncate<3>(head_index + 1)
+    next_tail : u3 = truncate<3>(tail_index + 1)
+    head_entry : ZtpuCompletion = entries[head_index]
+
+    when push_fire & (~clear) {
+        entries[tail_index] <- ZtpuCompletion {
+            tag = push_tag
+            opcode = push_opcode
+            status = push_status
+            error_code = push_error
+        }
+    }
+
+    head_index <- mux(clear, 0, mux(pop_fire, next_head, head_index))
+    tail_index <- mux(clear, 0, mux(push_fire, next_tail, tail_index))
+    count <- mux(
+        clear,
+        0,
+        mux(
+            push_fire & (~pop_fire),
+            truncate<4>(count + 1),
+            mux(pop_fire & (~push_fire), count - 1, count)
+        )
+    )
+    overflow <- mux(clear, 0, mux(overrun, 1, overflow))
+
+    push_ready = enable & (~full)
+    head_valid = enable & (~empty)
+    head_tag = head_entry.tag
+    head_opcode = head_entry.opcode
+    head_status = head_entry.status
+    head_error = head_entry.error_code
+
+    assert count_within_capacity @ clk { count <= 8 }
+    assert ready_matches_capacity @ clk {
+        push_ready == (enable & (count != 8))
+    }
+    assert valid_matches_occupancy @ clk {
+        head_valid == (enable & (count != 0))
+    }
+    cover reaches_capacity @ clk { count == 8 }
+    cover records_overflow @ clk { overflow }
+}

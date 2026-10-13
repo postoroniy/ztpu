@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_vmu_q16_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbVmuQ16",
+  "address_width": 64,
+  "data_width": 32,
+  "count_width": 16,
+  "fixed_point": "Q16.16",
+  "supported_operations": {
+    "exp_negative_clamp": 0,
+    "log_positive": 1,
+    "reduce_sum": 2,
+    "reduce_max": 3,
+    "softmax_forward": 4,
+    "softmax_backward_target": 5,
+    "rmsnorm_forward": 6,
+    "rmsnorm_backward": 7,
+    "softmax_backward": 8,
+    "relu": 9,
+    "softmax_forward_causal": 10,
+    "saturating_add": 11,
+    "saturating_scale_q16": 12,
+    "relu_backward": 13,
+    "q16_to_q8_pack": 14
+  },
+  "unsupported_operation_behavior": "one_done_cycle_without_ub_traffic",
+  "zero_length_behavior": "process_one_word_to_match_reference",
+  "q16_to_q8_pack": {
+    "scalar0": "requant_scale_s32",
+    "scalar1_low_bits": "requant_shift_u6",
+    "scalar2": "output_row_stride_bytes",
+    "scalar3_low_bits": "valid_lane_count_u3",
+    "scalar3_high_bits": "lane_stride_bytes_u24",
+    "output": "up_to_four_requantized_i8_lanes_per_u32_word",
+    "negative_128_mapping": "map_to_negative_127"
+  },
+  "excluded": [],
+  "timing": "cycle_exact_under_independent_ub_stalls"
+}

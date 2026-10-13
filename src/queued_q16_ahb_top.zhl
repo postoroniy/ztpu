@@ -1,0 +1,548 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.cfgbus
+import ztpu.axi_arbiter
+import ztpu.layout_path
+import ztpu.queued_q16_slice
+import std.bus.ahb_lite
+
+// Host-programmable queued Q16 top. AHB writes snapshot direct commands until
+// the finite queue accepts them; descriptor DMA and direct commands then share
+// the same arbitration implemented by ZtpuQueuedQ16Slice.
+module ZtpuQueuedQ16AhbTop<
+    TILE=2,
+    OIW=index_width(TILE),
+    ACC_DEPTH=TILE*TILE,
+    AIW=index_width(ACC_DEPTH),
+    LAST=TILE-1,
+    NATIVE_I8=0,
+    UB_DEPTH=256,
+    UB_IW=index_width(UB_DEPTH),
+    UB_ROWS=UB_DEPTH/4,
+    UB_RW=index_width(UB_ROWS)
+>
+where TILE >= 2 && is_power_of_two(TILE) && OIW == floor_log2(TILE) &&
+      ACC_DEPTH == TILE*TILE && AIW == floor_log2(ACC_DEPTH) &&
+      NATIVE_I8 >= 0 && NATIVE_I8 <= 1 &&
+      UB_DEPTH >= 8 && is_power_of_two(UB_DEPTH) &&
+      UB_IW == floor_log2(UB_DEPTH) && UB_ROWS == UB_DEPTH/4 &&
+      UB_RW == floor_log2(UB_ROWS) {
+    clock clk reset rst
+
+    interface ahb : AHBLite<32,32>.slave @clk
+    out irq : bit
+
+    out command_axi_ar_valid : bit
+    in command_axi_ar_ready : bit
+    out command_axi_ar_addr : uint<64>
+    out command_axi_ar_len : u8
+    out command_axi_ar_size : u3
+    in command_axi_r_valid : bit
+    out command_axi_r_ready : bit
+    in command_axi_r_data : u32
+    in command_axi_r_last : bit
+    in command_axi_r_resp : bits<2>
+
+    out axi_read_ar_valid : bit
+    in axi_read_ar_ready : bit
+    out axi_read_ar_addr : uint<64>
+    out axi_read_ar_len : u8
+    out axi_read_ar_size : u3
+    in axi_read_r_valid : bit
+    out axi_read_r_ready : bit
+    in axi_read_r_data : bits<32>
+    in axi_read_r_last : bit
+    in axi_read_r_resp : bits<2>
+
+    out axi_write_aw_valid : bit
+    in axi_write_aw_ready : bit
+    out axi_write_aw_addr : uint<64>
+    out axi_write_aw_len : u8
+    out axi_write_aw_size : u3
+    out axi_write_w_valid : bit
+    in axi_write_w_ready : bit
+    out axi_write_w_data : bits<32>
+    out axi_write_w_last : bit
+    in axi_write_b_valid : bit
+    out axi_write_b_ready : bit
+    in axi_write_b_resp : bits<2>
+
+    inst cfg : ZtpuQueuedCfgAhb64x32
+    inst layout_path : ZtpuLayoutPath64x32
+    inst queued_read_arbiter : ZtpuAxiReadArbiter2x64x32
+    inst queued_write_arbiter : ZtpuAxiWriteArbiter2x64x32
+    inst slice : ZtpuQueuedQ16Slice<
+        TILE=TILE, OIW=OIW, ACC_DEPTH=ACC_DEPTH, AIW=AIW, LAST=LAST,
+        NATIVE_I8=NATIVE_I8, UB_DEPTH=UB_DEPTH, UB_IW=UB_IW,
+        UB_ROWS=UB_ROWS, UB_RW=UB_RW
+    >
+
+    command_accepted : bit = cfg.control.queued_valid & slice.command_ready
+    pending_command : ZtpuCommand = cfg.control.queued_command
+    cfg_status : ZtpuCfgStatus = ZtpuCfgStatus {
+        direct = ZtpuCfgDirectStatus {
+            dma = ZtpuCfgUbDmaStatus {
+                busy = slice.direct_dma_busy done = slice.direct_dma_done
+                error = slice.direct_dma_error
+                error_code = slice.direct_dma_error_code
+            }
+            mxu = ZtpuCfgEngineStatus {
+                busy = slice.direct_mxu_busy done = slice.direct_mxu_done
+                error = slice.direct_mxu_error
+            }
+            adam = ZtpuCfgAdamStatus {
+                engine = ZtpuCfgEngineStatus {
+                    busy = slice.direct_adam_busy done = slice.direct_adam_done
+                    error = slice.direct_adam_error
+                }
+                beta1_power = slice.direct_adam_b1t
+                beta2_power = slice.direct_adam_b2t
+            }
+            vmu = ZtpuCfgEngineStatus {
+                busy = slice.direct_vmu_busy done = slice.direct_vmu_done
+                error = slice.direct_vmu_error
+            }
+        }
+        command = ZtpuCfgCommandStatus {
+            ready = slice.command_ready & (~cfg.control.queued_valid)
+            accept = command_accepted
+            count = slice.command_count
+            last_done = slice.last_done_tag
+        }
+        command_dma = ZtpuCfgCommandDmaStatus {
+            busy = slice.command_dma_busy done = slice.command_dma_done
+            error = slice.command_dma_error
+            error_code = slice.command_dma_error_code
+            fetched_count = slice.command_dma_fetched_count
+        }
+        completion = ZtpuCfgCompletionStatus {
+            valid = slice.completion_valid
+            tag = bitcast<u8>(slice.completion_tag)
+            opcode = bitcast<u4>(slice.completion_opcode)
+            status = bitcast<u4>(slice.completion_status)
+            error = bitcast<u8>(slice.completion_error)
+            count = slice.completion_count overflow = slice.completion_overflow
+        }
+        fault = ZtpuCfgFenceFaultStatus {
+            valid = slice.dma_fence_fault_valid
+            overflow = slice.dma_fence_fault_overflow
+            write = slice.dma_fence_fault_write
+            master = slice.dma_fence_fault_master
+            addr_low = truncate<32>(slice.dma_fence_fault_addr)
+            addr_high = truncate<32>(slice.dma_fence_fault_addr >> 32)
+            len = slice.dma_fence_fault_len size = slice.dma_fence_fault_size
+        }
+        perf = ZtpuCfgPerfStatus {
+            cycles = slice.perf_cycles busy_cycles = slice.perf_busy_cycles
+            command_count = slice.perf_command_count
+            dma_read_count = slice.perf_dma_read_count
+            dma_write_count = slice.perf_dma_write_count
+            error_count = slice.perf_error_count
+            error_valid = slice.perf_error_valid
+            error_code = slice.perf_error_code
+        }
+        zero_skip = ZtpuCfgZeroSkipStatus {
+            steps = slice.mxu_zs_steps total_macs = slice.mxu_zs_total_macs
+            active_macs = slice.mxu_zs_active_macs
+            skipped_macs = slice.mxu_zs_skipped_macs
+        }
+        layout = ZtpuCfgLayoutStatus {
+            valid = layout_path.layout_valid done = layout_path.layout_done
+            error = layout_path.layout_error
+            in_address_low = truncate<32>(layout_path.layout_in_addr)
+            in_address_high = truncate<32>(layout_path.layout_in_addr >> 32)
+            out_address_low = truncate<32>(layout_path.layout_out_addr)
+            out_address_high = truncate<32>(layout_path.layout_out_addr >> 32)
+            tiler_valid = layout_path.tiler_valid
+            tiler_done = layout_path.tiler_done
+        }
+        debug = ZtpuCfgDebugStatus {
+            command_output = ZtpuCfgCommandDebug {
+                valid = slice.debug_queue_output_valid
+                address_low = bitcast<u32>(
+                    truncate<32>(slice.debug_queue_output_address)
+                )
+                auxiliary_low = bitcast<u32>(
+                    truncate<32>(slice.debug_queue_output_auxiliary)
+                )
+                length = bitcast<u16>(slice.debug_queue_output_length)
+                opcode = bitcast<u4>(slice.debug_queue_output_opcode)
+            }
+            ub_dma = ZtpuCfgUbDmaDebug {
+                launch_pending = slice.debug_ub_launch_pending
+                capture_armed = slice.debug_ub_capture_armed
+                capture_ok = slice.debug_ub_capture_ok
+                capture = slice.debug_ub_capture
+                start = slice.debug_ub_start
+                launch_dram_low = bitcast<u32>(
+                    truncate<32>(slice.debug_ub_launch_dram_base)
+                )
+                launch_ub_low = bitcast<u32>(
+                    truncate<32>(slice.debug_ub_launch_ub_base)
+                )
+                launch_length = extend<32>(
+                    bitcast<u16>(slice.debug_ub_launch_length)
+                )
+                start_seen = slice.debug_ub_start_seen
+                start_store = slice.debug_ub_start_store
+                start_dram_low = bitcast<u32>(
+                    truncate<32>(slice.debug_ub_start_dram_base)
+                )
+                start_ub_low = bitcast<u32>(
+                    truncate<32>(slice.debug_ub_start_ub_base)
+                )
+                start_length = extend<32>(
+                    bitcast<u16>(slice.debug_ub_start_length)
+                )
+            }
+            config_command = ZtpuCfgCommandDebug {
+                valid = cfg.control.queued_valid
+                address_low = bitcast<u32>(truncate<32>(pending_command.address))
+                auxiliary_low = bitcast<u32>(
+                    truncate<32>(pending_command.auxiliary)
+                )
+                length = bitcast<u16>(pending_command.length)
+                opcode = bitcast<u4>(pending_command.opcode)
+            }
+            command_input = ZtpuCfgCommandDebug {
+                valid = slice.debug_queue_input_valid
+                address_low = bitcast<u32>(
+                    truncate<32>(slice.debug_queue_input_address)
+                )
+                auxiliary_low = bitcast<u32>(
+                    truncate<32>(slice.debug_queue_input_auxiliary)
+                )
+                length = bitcast<u16>(slice.debug_queue_input_length)
+                opcode = bitcast<u4>(slice.debug_queue_input_opcode)
+            }
+            queue = ZtpuCfgQueueDebug {
+                push = ZtpuCfgCommandDebug {
+                    valid = slice.debug_queue_push_seen
+                    address_low = bitcast<u32>(
+                        truncate<32>(slice.debug_queue_push_address)
+                    )
+                    auxiliary_low = bitcast<u32>(
+                        truncate<32>(slice.debug_queue_push_auxiliary)
+                    )
+                    length = bitcast<u16>(slice.debug_queue_push_length)
+                    opcode = bitcast<u4>(slice.debug_queue_push_opcode)
+                }
+                head = ZtpuCfgCommandDebug {
+                    valid = slice.debug_queue_head_seen
+                    address_low = bitcast<u32>(
+                        truncate<32>(slice.debug_queue_head_address)
+                    )
+                    auxiliary_low = bitcast<u32>(
+                        truncate<32>(slice.debug_queue_head_auxiliary)
+                    )
+                    length = bitcast<u16>(slice.debug_queue_head_length)
+                    opcode = bitcast<u4>(slice.debug_queue_head_opcode)
+                }
+                empty = slice.debug_queue_empty
+                current_head_valid = slice.debug_queue_head_valid
+                head_pointer = slice.debug_queue_head_pointer
+                tail_pointer = slice.debug_queue_tail_pointer
+                count = slice.debug_queue_count
+            }
+        }
+    }
+
+    ahb -> cfg.ahb
+    cfg.status = cfg_status
+
+    slice.command_valid = cfg.control.queued_valid
+    slice.command_opcode = pending_command.opcode
+    slice.command_address = pending_command.address
+    slice.command_auxiliary = pending_command.auxiliary
+    slice.command_length = pending_command.length
+    slice.command_tag = pending_command.tag
+    slice.command_dependency_tag = pending_command.dependency_tag
+    slice.command_src1_base = pending_command.source1_base
+    slice.command_scalar0 = pending_command.scalar0
+    slice.command_scalar1 = pending_command.scalar1
+    slice.command_scalar2 = pending_command.scalar2
+    slice.command_scalar3 = pending_command.scalar3
+    slice.command_mxu_valid = pending_command.mxu_valid
+    slice.command_mxu_a_base = pending_command.mxu_a_base
+    slice.command_mxu_b_base = pending_command.mxu_b_base
+    slice.command_mxu_c_base = pending_command.mxu_c_base
+    slice.command_mxu_acc_base = pending_command.mxu_acc_base
+    slice.command_mxu_a_stride = pending_command.mxu_a_stride
+    slice.command_mxu_b_stride = pending_command.mxu_b_stride
+    slice.command_mxu_k_dim = pending_command.mxu_k_dim
+    slice.command_mxu_accum_en = pending_command.mxu_accum_en
+    slice.command_mxu_acc_clear = pending_command.mxu_acc_clear
+    slice.command_mxu_spill_en = pending_command.mxu_spill_en
+    slice.command_mxu_restore_en = pending_command.mxu_restore_en
+    slice.command_mxu_mode = pending_command.mxu_mode
+    slice.command_mxu_a_transpose = pending_command.mxu_a_transpose
+    slice.command_mxu_b_transpose = pending_command.mxu_b_transpose
+    slice.command_mxu_zs_enable_a = pending_command.mxu_zs_enable_a
+    slice.command_mxu_zs_enable_b = pending_command.mxu_zs_enable_b
+    slice.command_adam_valid = pending_command.adam_valid
+    slice.command_adam_clear = pending_command.adam_clear
+    slice.command_adam_m_base = pending_command.adam_m_base
+    slice.command_adam_v_base = pending_command.adam_v_base
+    slice.command_adam_lr = pending_command.adam_lr
+    slice.command_adam_beta1 = pending_command.adam_beta1
+    slice.command_adam_beta2 = pending_command.adam_beta2
+    slice.command_adam_eps = pending_command.adam_eps
+    slice.direct_dma_enable = cfg.control.direct.dma.enable
+    slice.direct_dma_start = cfg.control.direct.dma.start
+    slice.direct_dma_store = cfg.control.direct.dma.store
+    slice.direct_dma_dram_base = cfg.control.direct.dma.dram_base
+    slice.direct_dma_ub_base = cfg.control.direct.dma.ub_base
+    slice.direct_dma_length = cfg.control.direct.dma.length
+    slice.direct_mxu_enable = cfg.control.direct.mxu.enable
+    slice.direct_mxu_start = cfg.control.direct.mxu.start
+    slice.direct_mxu_accum_en = cfg.control.direct.mxu.accumulate
+    slice.direct_mxu_acc_clear = cfg.control.direct.mxu.clear_accumulator
+    slice.direct_mxu_spill_en = cfg.control.direct.mxu.spill
+    slice.direct_mxu_restore_en = cfg.control.direct.mxu.restore
+    slice.direct_mxu_a_base = cfg.control.direct.mxu.a_base
+    slice.direct_mxu_b_base = cfg.control.direct.mxu.b_base
+    slice.direct_mxu_c_base = cfg.control.direct.mxu.c_base
+    slice.direct_mxu_acc_base = cfg.control.direct.mxu.accumulator_base
+    slice.direct_mxu_a_stride = cfg.control.direct.mxu.a_stride
+    slice.direct_mxu_b_stride = cfg.control.direct.mxu.b_stride
+    slice.direct_mxu_k_dim = cfg.control.direct.mxu.k_dim
+    slice.direct_mxu_rq_enable = cfg.control.direct.mxu.requant_enable
+    slice.direct_mxu_rq_scale = cfg.control.direct.mxu.requant_scale
+    slice.direct_mxu_rq_shift = cfg.control.direct.mxu.requant_shift
+    slice.direct_mxu_rq_zero = cfg.control.direct.mxu.requant_zero
+    slice.direct_mxu_mode = cfg.control.direct.mxu.mode
+    slice.direct_mxu_a_transpose = cfg.control.direct.mxu.transpose_a
+    slice.direct_mxu_b_transpose = cfg.control.direct.mxu.transpose_b
+    slice.direct_mxu_zs_enable_a = cfg.control.direct.mxu.zero_skip_a
+    slice.direct_mxu_zs_enable_b = cfg.control.direct.mxu.zero_skip_b
+    slice.direct_adam_enable = cfg.control.direct.adam.enable
+    slice.direct_adam_start = cfg.control.direct.adam.start
+    slice.direct_adam_clear = cfg.control.direct.adam.clear
+    slice.direct_adam_w_base = cfg.control.direct.adam.weight_base
+    slice.direct_adam_g_base = cfg.control.direct.adam.gradient_base
+    slice.direct_adam_m_base = cfg.control.direct.adam.moment_base
+    slice.direct_adam_v_base = cfg.control.direct.adam.variance_base
+    slice.direct_adam_length = cfg.control.direct.adam.length
+    slice.direct_adam_lr = cfg.control.direct.adam.learning_rate
+    slice.direct_adam_beta1 = cfg.control.direct.adam.beta1
+    slice.direct_adam_beta2 = cfg.control.direct.adam.beta2
+    slice.direct_adam_eps = cfg.control.direct.adam.epsilon
+    slice.direct_vmu_enable = cfg.control.direct.vmu.enable
+    slice.direct_vmu_start = cfg.control.direct.vmu.start
+    slice.direct_vmu_op = cfg.control.direct.vmu.operation
+    slice.direct_vmu_src0_base = cfg.control.direct.vmu.source0_base
+    slice.direct_vmu_src1_base = cfg.control.direct.vmu.source1_base
+    slice.direct_vmu_dst_base = cfg.control.direct.vmu.destination_base
+    slice.direct_vmu_length = cfg.control.direct.vmu.length
+    slice.direct_vmu_scalar0 = cfg.control.direct.vmu.scalar0
+    slice.direct_vmu_scalar1 = cfg.control.direct.vmu.scalar1
+    slice.direct_vmu_scalar2 = cfg.control.direct.vmu.scalar2
+    slice.direct_vmu_scalar3 = cfg.control.direct.vmu.scalar3
+
+    slice.external_layout_source_tiler = cfg.control.layout.source_tiler
+    slice.external_layout_busy = layout_path.layout_valid
+    slice.external_layout_done = layout_path.layout_done
+    slice.external_layout_error = layout_path.layout_error
+    slice.external_layout_dma_busy = layout_path.dma_busy
+    slice.external_layout_dma_done = layout_path.dma_done
+    slice.external_layout_dma_error = layout_path.dma_error
+
+    slice.command_dma_start = cfg.control.command_dma.start
+    slice.command_dma_clear = cfg.control.command_dma.clear
+    slice.command_dma_base = cfg.control.command_dma.base
+    slice.command_dma_count = cfg.control.command_dma.count
+    slice.completion_enable = cfg.control.completion.enable
+    slice.completion_clear = cfg.control.completion.clear
+    slice.completion_pop = cfg.control.completion.pop
+    irq = cfg.control.completion.irq_enable &
+        (slice.completion_valid | slice.completion_overflow)
+
+    slice.dma_fence_enable = cfg.control.fence.global_window.enable
+    slice.dma_fence_base = cfg.control.fence.global_window.base
+    slice.dma_fence_limit = cfg.control.fence.global_window.limit
+    slice.dma_fence_ub_enable = cfg.control.fence.ub_window.enable
+    slice.dma_fence_ub_base = cfg.control.fence.ub_window.base
+    slice.dma_fence_ub_limit = cfg.control.fence.ub_window.limit
+    slice.dma_fence_ub_read_enable = cfg.control.fence.ub_read_window.enable
+    slice.dma_fence_ub_read_base = cfg.control.fence.ub_read_window.base
+    slice.dma_fence_ub_read_limit = cfg.control.fence.ub_read_window.limit
+    slice.dma_fence_ub_write_enable = cfg.control.fence.ub_write_window.enable
+    slice.dma_fence_ub_write_base = cfg.control.fence.ub_write_window.base
+    slice.dma_fence_ub_write_limit = cfg.control.fence.ub_write_window.limit
+
+    layout_path.layout_start = cfg.control.layout.start |
+        slice.external_layout_command_start
+    layout_path.layout_dma_enable = cfg.control.layout.dma_enable
+    layout_path.layout_source_tiler = cfg.control.layout.source_tiler
+    layout_path.layout_in = cfg.control.layout.layout_in
+    layout_path.layout_out = cfg.control.layout.layout_out
+    layout_path.layout_base_in = cfg.control.layout.base_in
+    layout_path.layout_base_out = cfg.control.layout.base_out
+    layout_path.layout_in_stride_n = extend<64>(cfg.control.layout.in_stride_n)
+    layout_path.layout_in_stride_c = extend<64>(cfg.control.layout.in_stride_c)
+    layout_path.layout_in_stride_h = extend<64>(cfg.control.layout.in_stride_h)
+    layout_path.layout_in_stride_w = extend<64>(cfg.control.layout.in_stride_w)
+    layout_path.layout_in_stride_cb = extend<64>(cfg.control.layout.in_stride_cb)
+    layout_path.layout_out_stride_n = extend<64>(cfg.control.layout.out_stride_n)
+    layout_path.layout_out_stride_c = extend<64>(cfg.control.layout.out_stride_c)
+    layout_path.layout_out_stride_h = extend<64>(cfg.control.layout.out_stride_h)
+    layout_path.layout_out_stride_w = extend<64>(cfg.control.layout.out_stride_w)
+    layout_path.layout_out_stride_cb = extend<64>(cfg.control.layout.out_stride_cb)
+    layout_path.layout_n_dim = cfg.control.layout.n_dim
+    layout_path.layout_c_dim = cfg.control.layout.c_dim
+    layout_path.layout_h_dim = cfg.control.layout.h_dim
+    layout_path.layout_w_dim = cfg.control.layout.w_dim
+    layout_path.tiler_start = cfg.control.layout.tiler_start
+    layout_path.tiler_ready = cfg.control.layout.tiler_ready
+    layout_path.tiler_base = cfg.control.layout.tiler_base
+    layout_path.tiler_row_stride = extend<64>(cfg.control.layout.tiler_row_stride)
+    layout_path.tiler_col_stride = extend<64>(cfg.control.layout.tiler_col_stride)
+    layout_path.tiler_rows = cfg.control.layout.tiler_rows
+    layout_path.tiler_cols = cfg.control.layout.tiler_cols
+    layout_path.global_fence_enable = cfg.control.fence.global_window.enable
+    layout_path.global_fence_base = cfg.control.fence.global_window.base
+    layout_path.global_fence_limit = cfg.control.fence.global_window.limit
+    layout_path.layout_fence_enable = cfg.control.layout.layout_fence.enable
+    layout_path.layout_fence_base = cfg.control.layout.layout_fence.base
+    layout_path.layout_fence_limit = cfg.control.layout.layout_fence.limit
+    layout_path.read_fence_enable = cfg.control.layout.read_fence.enable
+    layout_path.read_fence_base = cfg.control.layout.read_fence.base
+    layout_path.read_fence_limit = cfg.control.layout.read_fence.limit
+    layout_path.write_fence_enable = cfg.control.layout.write_fence.enable
+    layout_path.write_fence_base = cfg.control.layout.write_fence.base
+    layout_path.write_fence_limit = cfg.control.layout.write_fence.limit
+
+    slice.dma_fence_fault_clear_valid = cfg.control.fence.clear_valid
+    slice.dma_fence_fault_clear_overflow = cfg.control.fence.clear_overflow
+    slice.external_fence_fault = layout_path.fence_fault
+    slice.external_fence_fault_write = layout_path.fence_fault_write
+    slice.external_fence_fault_master = mux(layout_path.fence_fault_write, 6, 5)
+    slice.external_fence_fault_addr = layout_path.fence_fault_addr
+    slice.external_fence_fault_len = layout_path.fence_fault_len
+    slice.external_fence_fault_size = layout_path.fence_fault_size
+    slice.perf_enable = cfg.control.perf.enable
+    slice.perf_clear = cfg.control.perf.clear
+    slice.perf_clear_error = cfg.control.perf.clear_error
+    reg layout_dma_error_previous : bit = 0
+    layout_dma_error_previous <- layout_path.dma_error
+    layout_dma_error_pulse : bit = layout_path.dma_error &
+        (~layout_dma_error_previous)
+    slice.external_busy = layout_path.dma_busy
+    slice.external_dma_read = layout_path.dma_read_transfer
+    slice.external_dma_write = layout_path.dma_write_transfer
+    slice.external_error_event = layout_dma_error_pulse
+    slice.external_error_code = 96
+    slice.command_axi_ar_ready = command_axi_ar_ready
+    slice.command_axi_r_valid = command_axi_r_valid
+    slice.command_axi_r_data = command_axi_r_data
+    slice.command_axi_r_last = command_axi_r_last
+    slice.command_axi_r_resp = command_axi_r_resp
+    command_axi_ar_valid = slice.command_axi_ar_valid
+    command_axi_ar_addr = slice.command_axi_ar_addr
+    command_axi_ar_len = slice.command_axi_ar_len
+    command_axi_ar_size = slice.command_axi_ar_size
+    command_axi_r_ready = slice.command_axi_r_ready
+
+    slice.axi_read -> queued_read_arbiter.m0
+    layout_path.axi_read -> queued_read_arbiter.m1
+    queued_read_arbiter.s.ar.ready = axi_read_ar_ready
+    queued_read_arbiter.s.r.valid = axi_read_r_valid
+    queued_read_arbiter.s.r.payload.data = axi_read_r_data
+    queued_read_arbiter.s.r.payload.last = axi_read_r_last
+    queued_read_arbiter.s.r.payload.resp = axi_read_r_resp
+    axi_read_ar_valid = queued_read_arbiter.s.ar.valid
+    axi_read_ar_addr = queued_read_arbiter.s.ar.payload.addr
+    axi_read_ar_len = queued_read_arbiter.s.ar.payload.len
+    axi_read_ar_size = queued_read_arbiter.s.ar.payload.size
+    axi_read_r_ready = queued_read_arbiter.s.r.ready
+
+    slice.axi_write -> queued_write_arbiter.m0
+    layout_path.axi_write -> queued_write_arbiter.m1
+    queued_write_arbiter.s.aw.ready = axi_write_aw_ready
+    queued_write_arbiter.s.w.ready = axi_write_w_ready
+    queued_write_arbiter.s.b.valid = axi_write_b_valid
+    queued_write_arbiter.s.b.payload.resp = axi_write_b_resp
+    axi_write_aw_valid = queued_write_arbiter.s.aw.valid
+    axi_write_aw_addr = queued_write_arbiter.s.aw.payload.addr
+    axi_write_aw_len = queued_write_arbiter.s.aw.payload.len
+    axi_write_aw_size = queued_write_arbiter.s.aw.payload.size
+    axi_write_w_valid = queued_write_arbiter.s.w.valid
+    axi_write_w_data = queued_write_arbiter.s.w.payload.data
+    axi_write_w_last = queued_write_arbiter.s.w.payload.last
+    axi_write_b_ready = queued_write_arbiter.s.b.ready
+}
+
+// Concrete 4x4 dual-mode profile: mode 3 is exact Q16 for TinyCar, while
+// descriptor modes 0..2 use the packed-int8 MXU. The default top remains the
+// 2x2 exact-Q16 MicroGPT profile.
+module ZtpuQueuedQ16AhbTop4x4 {
+    clock clk reset rst
+
+    interface ahb : AHBLite<32,32>.slave @clk
+    out irq : bit
+
+    out command_axi_ar_valid : bit
+    in command_axi_ar_ready : bit
+    out command_axi_ar_addr : uint<64>
+    out command_axi_ar_len : u8
+    out command_axi_ar_size : u3
+    in command_axi_r_valid : bit
+    out command_axi_r_ready : bit
+    in command_axi_r_data : u32
+    in command_axi_r_last : bit
+    in command_axi_r_resp : bits<2>
+
+    out axi_read_ar_valid : bit
+    in axi_read_ar_ready : bit
+    out axi_read_ar_addr : uint<64>
+    out axi_read_ar_len : u8
+    out axi_read_ar_size : u3
+    in axi_read_r_valid : bit
+    out axi_read_r_ready : bit
+    in axi_read_r_data : bits<32>
+    in axi_read_r_last : bit
+    in axi_read_r_resp : bits<2>
+
+    out axi_write_aw_valid : bit
+    in axi_write_aw_ready : bit
+    out axi_write_aw_addr : uint<64>
+    out axi_write_aw_len : u8
+    out axi_write_aw_size : u3
+    out axi_write_w_valid : bit
+    in axi_write_w_ready : bit
+    out axi_write_w_data : bits<32>
+    out axi_write_w_last : bit
+    in axi_write_b_valid : bit
+    out axi_write_b_ready : bit
+    in axi_write_b_resp : bits<2>
+
+    inst core : ZtpuQueuedQ16AhbTop<
+        TILE=4, OIW=2, ACC_DEPTH=16, AIW=4, LAST=3,
+        NATIVE_I8=1, UB_DEPTH=1024, UB_IW=10, UB_ROWS=256, UB_RW=8
+    > {
+        command_axi_ar_ready command_axi_r_valid command_axi_r_data
+        command_axi_r_last command_axi_r_resp axi_read_ar_ready
+        axi_read_r_valid axi_read_r_data axi_read_r_last axi_read_r_resp
+        axi_write_aw_ready axi_write_w_ready axi_write_b_valid axi_write_b_resp
+    }
+    ahb -> core.ahb
+    irq = core.irq
+    command_axi_ar_valid = core.command_axi_ar_valid
+    command_axi_ar_addr = core.command_axi_ar_addr
+    command_axi_ar_len = core.command_axi_ar_len
+    command_axi_ar_size = core.command_axi_ar_size
+    command_axi_r_ready = core.command_axi_r_ready
+    axi_read_ar_valid = core.axi_read_ar_valid
+    axi_read_ar_addr = core.axi_read_ar_addr
+    axi_read_ar_len = core.axi_read_ar_len
+    axi_read_ar_size = core.axi_read_ar_size
+    axi_read_r_ready = core.axi_read_r_ready
+    axi_write_aw_valid = core.axi_write_aw_valid
+    axi_write_aw_addr = core.axi_write_aw_addr
+    axi_write_aw_len = core.axi_write_aw_len
+    axi_write_aw_size = core.axi_write_aw_size
+    axi_write_w_valid = core.axi_write_w_valid
+    axi_write_w_data = core.axi_write_w_data
+    axi_write_w_last = core.axi_write_w_last
+    axi_write_b_ready = core.axi_write_b_ready
+}

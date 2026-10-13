@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+enum ZtpuUbDmaPhase {
+    Idle Done ReadAddress ReadData UbWrite UbRead WriteAddress WriteData
+    WriteResponse
+}
+
+// Fixed specialization of UnifiedBufferDMA for the current ZTPU data path:
+// 64-bit byte addresses, 32-bit beats, 16-bit byte length, max burst 4.
+module ZtpuUnifiedBufferDma64x32 {
+    clock clk reset rst
+
+    in start : bit
+    in direction : bit
+    in dram_base : uint<64>
+    in ub_base : uint<64>
+    in length_bytes : u16
+    out busy, done : bit
+    out reg error : bit = 0
+    out reg error_code : u8 = 0
+
+    out axi_read_ar_valid : bit
+    in axi_read_ar_ready : bit
+    out axi_read_ar_addr : uint<64>
+    out axi_read_ar_len : u8
+    out axi_read_ar_size : u3
+    in axi_read_r_valid : bit
+    out axi_read_r_ready : bit
+    in axi_read_r_data : bits<32>
+    in axi_read_r_last : bit
+    in axi_read_r_resp : bits<2>
+
+    out axi_write_aw_valid : bit
+    in axi_write_aw_ready : bit
+    out axi_write_aw_addr : uint<64>
+    out axi_write_aw_len : u8
+    out axi_write_aw_size : u3
+    out axi_write_w_valid : bit
+    in axi_write_w_ready : bit
+    out reg axi_write_w_data : bits<32> = 0
+    out axi_write_w_last : bit
+    in axi_write_b_valid : bit
+    out axi_write_b_ready : bit
+    in axi_write_b_resp : bits<2>
+
+    out ub_read_valid : bit
+    in ub_read_ready : bit
+    out ub_read_addr : uint<64>
+    in ub_read_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out reg ub_write_data : bits<32> = 0
+    out ub_write_mask : bits<4>
+
+    reg dram_address : uint<64> = 0
+    reg ub_address : uint<64> = 0
+    reg beats_left : u16 = 0
+    reg burst_left : u16 = 0
+
+    idle : bit = phase == ZtpuUbDmaPhase.Idle
+    done_state : bit = phase == ZtpuUbDmaPhase.Done
+    read_address_state : bit = phase == ZtpuUbDmaPhase.ReadAddress
+    read_data_state : bit = phase == ZtpuUbDmaPhase.ReadData
+    ub_write_state : bit = phase == ZtpuUbDmaPhase.UbWrite
+    ub_read_state : bit = phase == ZtpuUbDmaPhase.UbRead
+    write_address_state : bit = phase == ZtpuUbDmaPhase.WriteAddress
+    write_data_state : bit = phase == ZtpuUbDmaPhase.WriteData
+    write_response_state : bit = phase == ZtpuUbDmaPhase.WriteResponse
+
+    length_aligned : bit = length_bytes[1:0] == 0
+    length_valid : bit = (length_bytes != 0) & length_aligned
+    requested_beats : u16 = length_bytes >> 2
+    burst_length : u16 = mux(beats_left > 4, 4, beats_left)
+    burst_length_m1 : u8 = mux(
+        burst_length == 0,
+        0,
+        truncate<8>(burst_length) - 1
+    )
+    final_beat : bit = beats_left == 1
+    final_burst_beat : bit = burst_left == 1
+
+    read_address_fire : bit = read_address_state & axi_read_ar_ready
+    read_data_fire : bit = read_data_state & axi_read_r_valid
+    ub_write_fire : bit = ub_write_state & ub_write_ready
+    write_address_fire : bit = write_address_state & axi_write_aw_ready
+    ub_read_fire : bit = ub_read_state & ub_read_ready
+    write_data_fire : bit = write_data_state & axi_write_w_ready
+    write_response_fire : bit = write_response_state & axi_write_b_valid
+
+    dram_address <- mux(
+        idle & start,
+        dram_base,
+        mux(ub_write_fire | write_data_fire,
+            truncate<64>(dram_address + 4), dram_address)
+    )
+    ub_address <- mux(
+        idle & start,
+        ub_base,
+        mux(ub_write_fire | write_data_fire,
+            truncate<64>(ub_address + 4), ub_address)
+    )
+    beats_left <- mux(
+        idle & start,
+        requested_beats,
+        mux(ub_write_fire | write_data_fire, beats_left - 1, beats_left)
+    )
+    burst_left <- mux(
+        read_address_fire | write_address_fire,
+        burst_length,
+        mux(ub_write_fire | write_data_fire, burst_left - 1, burst_left)
+    )
+    ub_write_data <- mux(read_data_fire, axi_read_r_data, ub_write_data)
+    axi_write_w_data <- mux(ub_read_fire, ub_read_data, axi_write_w_data)
+    error <- mux(
+        idle & start,
+        ~length_valid,
+        mux(read_data_fire & (axi_read_r_resp != 0), 1,
+            mux(write_response_fire & (axi_write_b_resp != 0), 1, error))
+    )
+    error_code <- mux(
+        idle & start,
+        mux(length_valid, 0, 1),
+        mux(read_data_fire & (axi_read_r_resp != 0), 2,
+            mux(write_response_fire & (axi_write_b_resp != 0), 3,
+                error_code))
+    )
+
+    busy = ~idle
+    done = done_state
+
+    axi_read_ar_valid = read_address_state
+    axi_read_ar_addr = dram_address
+    axi_read_ar_len = burst_length_m1
+    axi_read_ar_size = 2
+    axi_read_r_ready = read_data_state
+
+    axi_write_aw_valid = write_address_state
+    axi_write_aw_addr = dram_address
+    axi_write_aw_len = burst_length_m1
+    axi_write_aw_size = 2
+    axi_write_w_valid = write_data_state
+    axi_write_w_last = write_data_state & final_burst_beat
+    axi_write_b_ready = write_response_state
+
+    ub_read_valid = ub_read_state
+    ub_read_addr = ub_address
+    ub_write_valid = ub_write_state
+    ub_write_addr = ub_address
+    ub_write_mask = 15
+
+    fsm phase : ZtpuUbDmaPhase = Idle {
+        Idle {
+            priority {
+                when start & !length_valid -> Done {}
+                when start & direction -> WriteAddress {}
+                when start -> ReadAddress {}
+            }
+        }
+        Done { -> Idle {} }
+        ReadAddress { when read_address_fire -> ReadData {} }
+        ReadData { when read_data_fire -> UbWrite {} }
+        UbWrite {
+            priority {
+                when ub_write_fire & final_beat -> Done {}
+                when ub_write_fire & final_burst_beat -> ReadAddress {}
+                when ub_write_fire -> ReadData {}
+            }
+        }
+        UbRead { when ub_read_fire -> WriteData {} }
+        WriteAddress { when write_address_fire -> UbRead {} }
+        WriteData {
+            priority {
+                when write_data_fire & final_burst_beat -> WriteResponse {}
+                when write_data_fire -> UbRead {}
+            }
+        }
+        WriteResponse {
+            priority {
+                when write_response_fire & (beats_left == 0) -> Done {}
+                when write_response_fire -> WriteAddress {}
+            }
+        }
+    }
+}

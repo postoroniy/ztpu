@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.axi_fence
+import ztpu.layout
+import ztpu.layout_dma
+import ztpu.tiler
+import std.bus.axi_burst
+
+module ZtpuLayoutPath64x32 {
+    clock clk reset rst
+    in layout_start, layout_dma_enable, layout_source_tiler : bit
+    in layout_in, layout_out : u2
+    in layout_base_in, layout_base_out : u64
+    in layout_in_stride_n, layout_in_stride_c, layout_in_stride_h : u64
+    in layout_in_stride_w, layout_in_stride_cb : u64
+    in layout_out_stride_n, layout_out_stride_c, layout_out_stride_h : u64
+    in layout_out_stride_w, layout_out_stride_cb : u64
+    in layout_n_dim : u3
+    in layout_c_dim, layout_h_dim, layout_w_dim : u7
+    out layout_valid, layout_done, layout_error : bit
+    out layout_in_addr, layout_out_addr : u64
+    out dma_busy, dma_done, dma_error : bit
+    out dma_read_transfer, dma_write_transfer : bit
+
+    in tiler_start, tiler_ready : bit
+    in tiler_base, tiler_row_stride, tiler_col_stride : u64
+    in tiler_rows, tiler_cols : u9
+    out tiler_valid, tiler_done : bit
+
+    in global_fence_enable : bit
+    in global_fence_base, global_fence_limit : u64
+    in layout_fence_enable : bit
+    in layout_fence_base, layout_fence_limit : u64
+    in read_fence_enable, write_fence_enable : bit
+    in read_fence_base, read_fence_limit : u64
+    in write_fence_base, write_fence_limit : u64
+    out fence_fault : bit
+    out fence_fault_write : bit
+    out fence_fault_addr : u64
+    out fence_fault_len : u8
+    out fence_fault_size : u3
+
+    interface axi_read : AXI4BurstReadSubset<64,32>.master @clk
+    interface axi_write : AXI4BurstWriteSubset<64,32>.master @clk
+
+    inst remap : ZtpuLayoutTranspose64
+    inst tiler : ZtpuTiler64x256
+    inst dma : ZtpuLayoutDmaCopy64x32
+    inst read_fence : ZtpuAxiReadFencePort64x32
+    inst write_fence : ZtpuAxiWriteFencePort64x32
+
+    remap.start = layout_start & (~layout_source_tiler)
+    remap.layout_in = layout_in
+    remap.layout_out = layout_out
+    remap.base_in = layout_base_in
+    remap.base_out = layout_base_out
+    remap.in_stride_n = layout_in_stride_n
+    remap.in_stride_c = layout_in_stride_c
+    remap.in_stride_h = layout_in_stride_h
+    remap.in_stride_w = layout_in_stride_w
+    remap.in_stride_cb = layout_in_stride_cb
+    remap.out_stride_n = layout_out_stride_n
+    remap.out_stride_c = layout_out_stride_c
+    remap.out_stride_h = layout_out_stride_h
+    remap.out_stride_w = layout_out_stride_w
+    remap.out_stride_cb = layout_out_stride_cb
+    remap.n_dim = layout_n_dim
+    remap.c_dim = layout_c_dim
+    remap.h_dim = layout_h_dim
+    remap.w_dim = layout_w_dim
+
+    tiler_launch : bit = tiler_start & layout_dma_enable &
+        layout_source_tiler & (~remap.stream.valid) & (~dma.busy)
+    tiler.start = tiler_launch
+    tiler.base_addr = tiler_base
+    tiler.row_stride = tiler_row_stride
+    tiler.col_stride = tiler_col_stride
+    tiler.rows = tiler_rows
+    tiler.cols = tiler_cols
+
+    selected_valid : bit = mux(
+        layout_source_tiler, tiler.stream.valid, remap.stream.valid
+    )
+    selected_in_addr : u64 = mux(
+        layout_source_tiler,
+        truncate<64>(layout_base_in + tiler.stream.payload.addr),
+        remap.stream.payload.in_addr
+    )
+    selected_out_addr : u64 = mux(
+        layout_source_tiler,
+        truncate<64>(layout_base_out + tiler.stream.payload.addr),
+        remap.stream.payload.out_addr
+    )
+    dma.enable = layout_dma_enable
+    dma.layout.valid = selected_valid
+    dma.layout.payload = ZtpuLayoutAddressPair64 {
+        in_addr = selected_in_addr
+        out_addr = selected_out_addr
+    }
+    remap_ready_value : bit = mux(layout_source_tiler, 0, dma.layout.ready)
+    tiler_ready_value : bit = mux(
+        layout_source_tiler, dma.layout.ready, tiler_ready
+    )
+    remap.stream.ready = remap_ready_value
+    tiler.stream.ready = tiler_ready_value
+
+    reg tiler_done_pending : bit = 0
+    priority {
+        when !layout_source_tiler { tiler_done_pending <- 0 }
+        when layout_source_tiler & tiler.done & tiler_ready_value {
+            tiler_done_pending <- 1
+        }
+        when tiler_done_pending & dma.done { tiler_done_pending <- 0 }
+    }
+
+    layout_valid = mux(
+        layout_source_tiler, tiler.stream.valid | dma.busy, remap.stream.valid
+    )
+    layout_done = mux(
+        layout_source_tiler, tiler_done_pending & dma.done, remap.done
+    )
+    layout_error = mux(layout_source_tiler, dma.error, remap.error)
+    dma_busy = dma.busy
+    dma_done = dma.done
+    dma_error = dma.error
+    dma_read_transfer = axi_read.ar.transfer
+    dma_write_transfer = axi_write.aw.transfer
+    layout_in_addr = selected_in_addr
+    layout_out_addr = selected_out_addr
+    tiler_valid = tiler.stream.valid
+    tiler_done = tiler.done
+
+    maximum_address : u64 = bitcast<u64>(0xffffffffffffffff)
+    global_base : u64 = mux(global_fence_enable, global_fence_base, 0)
+    global_limit : u64 = mux(
+        global_fence_enable, global_fence_limit, maximum_address
+    )
+    domain_base : u64 = mux(layout_fence_enable, layout_fence_base, 0)
+    domain_limit : u64 = mux(
+        layout_fence_enable, layout_fence_limit, maximum_address
+    )
+    read_base : u64 = mux(read_fence_enable, read_fence_base, 0)
+    read_limit : u64 = mux(read_fence_enable, read_fence_limit, maximum_address)
+    write_base : u64 = mux(write_fence_enable, write_fence_base, 0)
+    write_limit : u64 = mux(
+        write_fence_enable, write_fence_limit, maximum_address
+    )
+    read_effective_base : u64 = ztpu_fence_max3(
+        global_base, domain_base, read_base
+    )
+    read_effective_limit : u64 = ztpu_fence_min3(
+        global_limit, domain_limit, read_limit
+    )
+    write_effective_base : u64 = ztpu_fence_max3(
+        global_base, domain_base, write_base
+    )
+    write_effective_limit : u64 = ztpu_fence_min3(
+        global_limit, domain_limit, write_limit
+    )
+
+    read_fence.enable = global_fence_enable | layout_fence_enable |
+        read_fence_enable
+    read_fence.base = read_effective_base
+    read_fence.limit = read_effective_limit
+    dma.axi_read -> read_fence.up
+    axi_read -> read_fence.down
+
+    write_fence.enable = global_fence_enable | layout_fence_enable |
+        write_fence_enable
+    write_fence.base = write_effective_base
+    write_fence.limit = write_effective_limit
+    dma.axi_write -> write_fence.up
+    axi_write -> write_fence.down
+
+    fence_fault = read_fence.fault | write_fence.fault
+    fence_fault_write = (~read_fence.fault) & write_fence.fault
+    fence_fault_addr = mux(
+        read_fence.fault, read_fence.fault_addr, write_fence.fault_addr
+    )
+    fence_fault_len = mux(
+        read_fence.fault, read_fence.fault_len, write_fence.fault_len
+    )
+    fence_fault_size = mux(
+        read_fence.fault, read_fence.fault_size, write_fence.fault_size
+    )
+}

@@ -1,0 +1,61 @@
+{
+  "schema": "ztpu-formal-targets-v1",
+  "profile": "portable",
+  "default_timeout_seconds": 90,
+  "targets": [
+    {
+      "name": "completion_queue",
+      "source": "src/storage.zhl",
+      "top": "ZtpuCompletionQueue8",
+      "depth": 16,
+      "require": "proven",
+      "properties": [
+        "assert count_within_capacity",
+        "assert ready_matches_capacity",
+        "assert valid_matches_occupancy",
+        "cover reaches_capacity",
+        "cover records_overflow"
+      ]
+    },
+    {
+      "name": "fence_fault_latch",
+      "source": "src/fault_status.zhl",
+      "top": "ZtpuDmaFenceFaultLatch64",
+      "depth": 16,
+      "require": "proven",
+      "properties": [
+        "assert overflow_implies_valid",
+        "cover captures_first_fault",
+        "cover records_repeated_fault"
+      ]
+    },
+    {
+      "name": "axi_read_fence",
+      "source": "src/axi_fence.zhl",
+      "top": "ZtpuAxiReadFence64x32",
+      "depth": 12,
+      "require": "proven",
+      "properties": [
+        "assert rejected_read_not_forwarded",
+        "assert blocked_read_not_forwarded",
+        "assert read_fault_is_enabled_rejection",
+        "assert blocked_read_returns_error",
+        "cover rejects_read"
+      ]
+    },
+    {
+      "name": "axi_write_fence",
+      "source": "src/axi_fence.zhl",
+      "top": "ZtpuAxiWriteFence64x32",
+      "depth": 12,
+      "require": "proven",
+      "properties": [
+        "assert rejected_write_not_forwarded",
+        "assert blocked_write_address_not_forwarded",
+        "assert write_fault_is_enabled_rejection",
+        "assert blocked_write_returns_error",
+        "cover rejects_write"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "contract": "ztpu_queued_q16_slice_v1",
+  "source_language": "zlang",
+  "top": "ZtpuQueuedQ16Slice",
+  "command_queue_depth": 4,
+  "completion_queue_depth": 8,
+  "unified_buffer": {
+    "depth_words": 256,
+    "data_width": 32,
+    "read_ports": 2,
+    "write_ports": 1
+  },
+  "supported_opcodes": {
+    "layout_remap": 1,
+    "layout_dma": 2,
+    "ub_load": 3,
+    "ub_store": 4,
+    "ub_compute_exact_q16": 5,
+    "ub_adam_q16": 6,
+    "ub_vmu_q16": 7,
+    "ub_dcopy": 8
+  },
+  "supported_vmu_operations": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+  "command_submission": ["direct_ready_valid", "descriptor_dma_v1"],
+  "live_register_execution": {
+    "engines": ["ub_dma", "mxu", "vmu", "adam"],
+    "shares": ["unified_buffer", "fenced_axi", "engine_status"],
+    "queue_policy": "bypasses_command_and_completion_queues",
+    "priority": "dma_then_mxu_then_adam_then_vmu_before_queued_dispatch"
+  },
+  "command_dma_axi": "separate_64_bit_address_32_bit_read_master",
+  "dma_fences": {
+    "range": "half_open_base_limit",
+    "masters": {
+      "ub_read": {
+        "id": 7,
+        "effective_range": "intersection(global,ub_domain,ub_read_master)"
+      },
+      "ub_write": {
+        "id": 8,
+        "effective_range": "intersection(global,ub_domain,ub_write_master)"
+      },
+      "command_read": {
+        "id": 9,
+        "effective_range": "global_only"
+      }
+    },
+    "fault_policy": "first_fault_sticky_with_overflow"
+  },
+  "performance_monitor": {
+    "counter_width": 32,
+    "counts_rejected_external_dma_requests": false,
+    "command_event": "queued_dispatch"
+  },
+  "unsupported_command_behavior": "not_ready_and_command_supported_low",
+  "execution": "single_engine_in_order_with_tag_dependencies",
+  "layout_execution": {
+    "source": "external_migrated_layout_path",
+    "dispatch_blocked_when_tiler_selected": true,
+    "opcode_1_completion": "layout_remap_done",
+    "opcode_2_completion": "layout_dma_done",
+    "completion_error_code": 0
+  },
+  "compute_shape": "2x2",
+  "compute_mode": 3,
+  "dma_error_base": 64,
+  "excluded": [
+    "configuration_bus_frontend",
+    "packed_int8_compute",
+    "full_ztpu_top"
+  ],
+  "verification": "direct_systemverilog_end_to_end_with_softmax_q8_pack_adam_strided_dcopy_bulk_descriptor_submission_hierarchical_fences_fault_state_and_perf_counters"
+}

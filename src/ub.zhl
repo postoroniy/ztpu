@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+// One physical 1R1W copy used by the replicated-read unified buffer.
+module ZtpuUbMemoryReplica<type T,D,IW,MW>
+where D >= 2 && is_power_of_two(D) && IW == floor_log2(D) {
+    clock clk reset rst
+
+    in read_row : uint<IW>
+    in write_enable : bit
+    in write_row : uint<IW>
+    in write_data : T
+    in write_mask : bits<MW>
+    out read_data : T
+
+    memory table : mem<T,D> {
+        read_latency 0
+        collision read_first
+        reset { contents preserve read_data preserve }
+    }
+
+    table.read_address = read_row
+    table.write_enable = write_enable
+    table.write_address = write_row
+    table.write_data = write_data
+    table.write_mask = write_mask
+    read_data = table.read_data
+}
+
+// Two physical replicas provide independent reads. Writes are decoded once and
+// broadcast to the selected bank in both replicas.
+module ZtpuReplicatedBanked2R1W<type T,BANKS,ROWS,BW,RW,AW,MW>
+where BANKS >= 2 && is_power_of_two(BANKS) && BW == floor_log2(BANKS) &&
+      ROWS >= 2 && is_power_of_two(ROWS) && RW == floor_log2(ROWS) &&
+      AW == BW + RW {
+    clock clk reset rst
+
+    in read0_address : uint<AW>
+    in read1_address : uint<AW>
+    in write_enable : bit
+    in write_address : uint<AW>
+    in write_data : T
+    in write_mask : bits<MW>
+    out read0_data : T
+    out read1_data : T
+
+    read0_bank = truncate<BW>(read0_address)
+    read1_bank = truncate<BW>(read1_address)
+    write_bank = truncate<BW>(write_address)
+    read0_row = truncate<RW>(read0_address >> BW)
+    read1_row = truncate<RW>(read1_address >> BW)
+    write_row = truncate<RW>(write_address >> BW)
+
+    read0[BANKS] : ZtpuUbMemoryReplica<T=T,D=ROWS,IW=RW,MW=MW>
+    read1[BANKS] : ZtpuUbMemoryReplica<T=T,D=ROWS,IW=RW,MW=MW>
+
+    generate(i in 0..BANKS) {
+        read0[i].read_row = read0_row
+        read0[i].write_enable = write_enable & (write_bank == i)
+        read0[i].write_row = write_row
+        read0[i].write_data = write_data
+        read0[i].write_mask = write_mask
+
+        read1[i].read_row = read1_row
+        read1[i].write_enable = write_enable & (write_bank == i)
+        read1[i].write_row = write_row
+        read1[i].write_data = write_data
+        read1[i].write_mask = write_mask
+    }
+
+    read0_data = read0[read0_bank].read_data
+    read1_data = read1[read1_bank].read_data
+}
+
+// Four-bank inferred memory with two reads and one byte-masked write.
+// Concrete wrappers provide 256-word and 1024-word configurations.
+module ZtpuUnifiedBufferNx32<
+    D=256,
+    IW=index_width(D),
+    ROWS=D/4,
+    RW=index_width(ROWS)
+>
+where D >= 8 && is_power_of_two(D) && IW == floor_log2(D) &&
+      ROWS == D/4 && is_power_of_two(ROWS) && RW == floor_log2(ROWS) {
+    clock clk reset rst
+
+    in read0_valid : bit
+    out read0_ready : bit
+    in read0_addr : uint<64>
+    out read0_data : u32
+
+    in read1_valid : bit
+    out read1_ready : bit
+    in read1_addr : uint<64>
+    out read1_data : u32
+
+    in write_valid : bit
+    out write_ready : bit
+    in write_addr : uint<64>
+    in write_data : u32
+    in write_mask : bits<4>
+
+    // Drop the byte offset and decode the low IW word-address bits. Higher
+    // address bits intentionally alias.
+    read0_word : uint<IW> = truncate<IW>(read0_addr >> 2)
+    read1_word : uint<IW> = truncate<IW>(read1_addr >> 2)
+    write_word : uint<IW> = truncate<IW>(write_addr >> 2)
+
+    storage : ZtpuReplicatedBanked2R1W<
+        T=u32,BANKS=4,ROWS=ROWS,BW=2,RW=RW,AW=IW,MW=4
+    >
+    storage.read0_address = read0_word
+    storage.read1_address = read1_word
+    storage.write_enable = write_valid
+    storage.write_address = write_word
+    storage.write_data = write_data
+    storage.write_mask = write_mask
+
+    read0_ready = 1
+    read1_ready = 1
+    write_ready = 1
+    read0_data = storage.read0_data
+    read1_data = storage.read1_data
+}
+
+module ZtpuUnifiedBuffer256x32 {
+    clock clk reset rst
+
+    in read0_valid : bit
+    out read0_ready : bit
+    in read0_addr : uint<64>
+    out read0_data : u32
+    in read1_valid : bit
+    out read1_ready : bit
+    in read1_addr : uint<64>
+    out read1_data : u32
+    in write_valid : bit
+    out write_ready : bit
+    in write_addr : uint<64>
+    in write_data : u32
+    in write_mask : bits<4>
+
+    inst core : ZtpuUnifiedBufferNx32<D=256,IW=8,ROWS=64,RW=6> {
+        read0_valid read0_addr read1_valid read1_addr
+        write_valid write_addr write_data write_mask
+    }
+    read0_ready = core.read0_ready
+    read0_data = core.read0_data
+    read1_ready = core.read1_ready
+    read1_data = core.read1_data
+    write_ready = core.write_ready
+}
+
+module ZtpuUnifiedBuffer1024x32 {
+    clock clk reset rst
+
+    in read0_valid : bit
+    out read0_ready : bit
+    in read0_addr : uint<64>
+    out read0_data : u32
+    in read1_valid : bit
+    out read1_ready : bit
+    in read1_addr : uint<64>
+    out read1_data : u32
+    in write_valid : bit
+    out write_ready : bit
+    in write_addr : uint<64>
+    in write_data : u32
+    in write_mask : bits<4>
+
+    inst core : ZtpuUnifiedBufferNx32<D=1024,IW=10,ROWS=256,RW=8> {
+        read0_valid read0_addr read1_valid read1_addr
+        write_valid write_addr write_data write_mask
+    }
+    read0_ready = core.read0_ready
+    read0_data = core.read0_data
+    read1_ready = core.read1_ready
+    read1_data = core.read1_data
+    write_ready = core.write_ready
+}

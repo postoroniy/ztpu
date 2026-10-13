@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "contract": "ztpu_scheduler_v1",
+  "source_language": "zlang",
+  "top": "ZtpuCommandQueue4",
+  "depth": 4,
+  "tag_width": 8,
+  "dependency_instance_width": 16,
+  "enqueue_pipeline": ["capture", "launch", "commit"],
+  "issue_register": true,
+  "repeated_tag_instances": true,
+  "direct_preload": false,
+  "timing": "cycle_exact"
+}

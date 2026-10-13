@@ -1,0 +1,755 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+import ztpu.fixed_luts
+import ztpu.fxp_math
+import ztpu.arithmetic
+
+enum ZtpuUbVmuElementwisePhase {
+    Idle
+    Relu
+    Add
+    Scale
+    ReluBackward
+    Done
+}
+
+enum ZtpuUbVmuPhase {
+    Idle
+    ReductionInit
+    ReductionLoop
+    ExpRequest
+    SoftmaxRecipStart
+    SoftmaxRecipWait
+    SoftmaxNormalize
+    SoftmaxBwdTarget
+    RmsSumsqInit
+    RmsSumsqLoop
+    RmsRsqrtStart
+    RmsRsqrtWait
+    RmsForward
+    RmsDotInit
+    RmsDotLoop
+    RmsBackward
+    LogRequest
+    Relu
+    SoftmaxDotInit
+    SoftmaxDotLoop
+    SoftmaxBackward
+    Add
+    Scale
+    ReluBackward
+    Done
+    ExpWait
+    ExpWrite
+    LogWait
+    LogWrite
+    Q8PackRead
+    Q8PackWrite
+}
+
+fn ztpu_vmu_sat_s32_from_s33(value : s33) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+fn ztpu_vmu_sat_s32_from_s64(value : s64) -> s32 {
+    mux(
+        value > 2147483647,
+        2147483647,
+        mux(value < -2147483648, -2147483648, truncate<32>(value))
+    )
+}
+
+fn ztpu_vmu_sat_add_s32(a : s32, b : s32) -> s32 {
+    ztpu_vmu_sat_s32_from_s33(
+        truncate<33>(extend<33>(a) + extend<33>(b))
+    )
+}
+
+fn ztpu_vmu_sat_sub_s32(a : s32, b : s32) -> s32 {
+    ztpu_vmu_sat_s32_from_s33(
+        truncate<33>(extend<33>(a) - extend<33>(b))
+    )
+}
+
+fn ztpu_vmu_sat_mul_q16_s32(a : s32, b : s32) -> s32 {
+    ztpu_vmu_sat_s32_from_s64(
+        truncate<64>((a * b) + 32768) >> 16
+    )
+}
+
+// Fixed-point elementwise VMU operations.
+module ZtpuUbVmuElementwiseQ16 {
+    clock clk reset rst
+
+    in start, enable : bit
+    in op : u4
+    in src0_base, src1_base, dst_base : uint<64>
+    in length : u16
+    in scalar0, scalar1 : s32
+    in scalar2, scalar3 : u32
+
+    out busy, done, error : bit
+
+    out ub_read0_valid : bit
+    in ub_read0_ready : bit
+    out ub_read0_addr : uint<64>
+    in ub_read0_data : bits<32>
+
+    out ub_read1_valid : bit
+    in ub_read1_ready : bit
+    out ub_read1_addr : uint<64>
+    in ub_read1_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    reg index : u16 = 0
+    reg src0_address : uint<64> = 0
+    reg src1_address : uint<64> = 0
+    reg dst_address : uint<64> = 0
+    reg word_count : u16 = 0
+    reg scale : s32 = 0
+
+    idle : bit = phase == ZtpuUbVmuElementwisePhase.Idle
+    relu_state : bit = phase == ZtpuUbVmuElementwisePhase.Relu
+    add_state : bit = phase == ZtpuUbVmuElementwisePhase.Add
+    scale_state : bit = phase == ZtpuUbVmuElementwisePhase.Scale
+    relu_bwd_state : bit = phase == ZtpuUbVmuElementwisePhase.ReluBackward
+    done_state : bit = phase == ZtpuUbVmuElementwisePhase.Done
+    elementwise_state : bit = relu_state | add_state | scale_state | relu_bwd_state
+    dual_read_state : bit = add_state | relu_bwd_state
+
+    start_accepted : bit = idle & start & enable
+    byte_offset : uint<64> = extend<64>(index) << 2
+    read0_address_value : uint<64> = truncate<64>(src0_address + byte_offset)
+    read1_address_value : uint<64> = truncate<64>(src1_address + byte_offset)
+    write_address_value : uint<64> = truncate<64>(dst_address + byte_offset)
+
+    read_ready : bit = ub_read0_ready & mux(dual_read_state, ub_read1_ready, 1)
+    write_valid_value = elementwise_state & read_ready
+    write_fire : bit = write_valid_value & ub_write_ready
+    next_index_wide : u17 = truncate<17>(extend<17>(index) + 1)
+    last_word : bit = next_index_wide >= extend<17>(word_count)
+
+    src0_value : s32 = bitcast<s32>(ub_read0_data)
+    src1_value : s32 = bitcast<s32>(ub_read1_data)
+    relu_value : s32 = mux(src0_value < 0, 0, src0_value)
+    add_value : s32 = ztpu_vmu_sat_add_s32(src0_value, src1_value)
+    scale_value : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, scale)
+    relu_bwd_value : s32 = mux(src0_value > 0, src1_value, 0)
+    result_value : s32 = mux(
+        relu_state,
+        relu_value,
+        mux(add_state, add_value, mux(scale_state, scale_value, relu_bwd_value))
+    )
+
+    index <- mux(
+        start_accepted,
+        0,
+        mux(write_fire & (~last_word), truncate<16>(index + 1), index)
+    )
+    src0_address <- mux(start_accepted, src0_base, src0_address)
+    src1_address <- mux(start_accepted, src1_base, src1_address)
+    dst_address <- mux(start_accepted, dst_base, dst_address)
+    word_count <- mux(start_accepted, length, word_count)
+    scale <- mux(start_accepted, scalar0, scale)
+
+    busy = ~idle
+    done = done_state
+    error = 0
+    ub_read0_valid = elementwise_state
+    ub_read0_addr = read0_address_value
+    ub_read1_valid = dual_read_state
+    ub_read1_addr = read1_address_value
+    ub_write_valid = write_valid_value
+    ub_write_addr = write_address_value
+    ub_write_data = bitcast<bits<32>>(result_value)
+    ub_write_mask = 15
+
+    fsm phase : ZtpuUbVmuElementwisePhase = Idle {
+        Idle {
+            priority {
+                when start_accepted & (op == 9) -> Relu {}
+                when start_accepted & (op == 11) -> Add {}
+                when start_accepted & (op == 12) -> Scale {}
+                when start_accepted & (op == 13) -> ReluBackward {}
+                when start_accepted -> Done {}
+            }
+        }
+        Relu { when write_fire & last_word -> Done {} }
+        Add { when write_fire & last_word -> Done {} }
+        Scale { when write_fire & last_word -> Done {} }
+        ReluBackward { when write_fire & last_word -> Done {} }
+        Done { -> Idle {} }
+    }
+}
+
+// Complete Q16 VMU path for operations 0 through 14.
+module ZtpuUbVmuQ16 {
+    clock clk reset rst
+
+    in start, enable : bit
+    in op : u4
+    in src0_base, src1_base, dst_base : uint<64>
+    in length : u16
+    in scalar0, scalar1 : s32
+    in scalar2, scalar3 : u32
+
+    out busy, done, error : bit
+
+    out ub_read0_valid : bit
+    in ub_read0_ready : bit
+    out ub_read0_addr : uint<64>
+    in ub_read0_data : bits<32>
+
+    out ub_read1_valid : bit
+    in ub_read1_ready : bit
+    out ub_read1_addr : uint<64>
+    in ub_read1_data : bits<32>
+
+    out ub_write_valid : bit
+    in ub_write_ready : bit
+    out ub_write_addr : uint<64>
+    out ub_write_data : bits<32>
+    out ub_write_mask : bits<4>
+
+    inst exp_lut : ZtpuExpNegLutQ16
+    inst ln_lut : ZtpuLnMantissaLutQ16
+    inst reciprocal : ZtpuReciprocalNr2Q16
+    inst rsqrt : ZtpuRsqrtNr2Q16
+    inst q8_requant : ZtpuAccRequant8
+
+    reg index : u16 = 0
+    reg operation : u4 = 0
+    reg src0_address : uint<64> = 0
+    reg src1_address : uint<64> = 0
+    reg dst_address : uint<64> = 0
+    reg word_count : u16 = 0
+    reg epsilon : s32 = 0
+    reg inverse_length : s32 = 0
+    reg target : u32 = 0
+    reg packed_control : u32 = 0
+    reg reduction_accumulator : s64 = 0
+    reg reduction_maximum : s32 = -2147483648
+    reg softmax_maximum : s32 = 0
+    reg softmax_sum : u32 = 0
+    reg softmax_inverse : s32 = 0
+    reg exp_word : u32 = 0
+    reg log_word : u32 = 0
+    reg log_exponent : s7 = 0
+    reg rsqrt_input : u32 = 1
+    reg rms_r : s32 = 0
+    reg rms_r2 : s32 = 0
+    reg rms_r3 : s32 = 0
+    reg dot_accumulator : s64 = 0
+    reg mean_dot : s32 = 0
+    reg rms_term : s32 = 0
+    reg softmax_dot_accumulator : s64 = 0
+    reg softmax_dot : s32 = 0
+    reg q8_lane : u3 = 0
+    reg q8_word : u32 = 0
+
+    idle : bit = phase == ZtpuUbVmuPhase.Idle
+    reduction_init_state : bit = phase == ZtpuUbVmuPhase.ReductionInit
+    reduction_loop_state : bit = phase == ZtpuUbVmuPhase.ReductionLoop
+    exp_request_state : bit = phase == ZtpuUbVmuPhase.ExpRequest
+    softmax_recip_start_state : bit = phase == ZtpuUbVmuPhase.SoftmaxRecipStart
+    softmax_recip_wait_state : bit = phase == ZtpuUbVmuPhase.SoftmaxRecipWait
+    softmax_normalize_state : bit = phase == ZtpuUbVmuPhase.SoftmaxNormalize
+    softmax_bwd_target_state : bit = phase == ZtpuUbVmuPhase.SoftmaxBwdTarget
+    rms_sumsq_init_state : bit = phase == ZtpuUbVmuPhase.RmsSumsqInit
+    rms_sumsq_loop_state : bit = phase == ZtpuUbVmuPhase.RmsSumsqLoop
+    rms_rsqrt_start_state : bit = phase == ZtpuUbVmuPhase.RmsRsqrtStart
+    rms_rsqrt_wait_state : bit = phase == ZtpuUbVmuPhase.RmsRsqrtWait
+    rms_forward_state : bit = phase == ZtpuUbVmuPhase.RmsForward
+    rms_dot_init_state : bit = phase == ZtpuUbVmuPhase.RmsDotInit
+    rms_dot_loop_state : bit = phase == ZtpuUbVmuPhase.RmsDotLoop
+    rms_backward_state : bit = phase == ZtpuUbVmuPhase.RmsBackward
+    log_request_state : bit = phase == ZtpuUbVmuPhase.LogRequest
+    relu_state : bit = phase == ZtpuUbVmuPhase.Relu
+    softmax_dot_init_state : bit = phase == ZtpuUbVmuPhase.SoftmaxDotInit
+    softmax_dot_loop_state : bit = phase == ZtpuUbVmuPhase.SoftmaxDotLoop
+    softmax_backward_state : bit = phase == ZtpuUbVmuPhase.SoftmaxBackward
+    add_state : bit = phase == ZtpuUbVmuPhase.Add
+    scale_state : bit = phase == ZtpuUbVmuPhase.Scale
+    relu_backward_state : bit = phase == ZtpuUbVmuPhase.ReluBackward
+    done_state : bit = phase == ZtpuUbVmuPhase.Done
+    exp_wait_state : bit = phase == ZtpuUbVmuPhase.ExpWait
+    exp_write_state : bit = phase == ZtpuUbVmuPhase.ExpWrite
+    log_wait_state : bit = phase == ZtpuUbVmuPhase.LogWait
+    log_write_state : bit = phase == ZtpuUbVmuPhase.LogWrite
+    q8_pack_read_state : bit = phase == ZtpuUbVmuPhase.Q8PackRead
+    q8_pack_write_state : bit = phase == ZtpuUbVmuPhase.Q8PackWrite
+
+    start_accepted : bit = idle & start & enable
+    byte_offset : uint<64> = extend<64>(index) << 2
+    src0_indexed : uint<64> = truncate<64>(src0_address + byte_offset)
+    src1_indexed : uint<64> = truncate<64>(src1_address + byte_offset)
+    dst_indexed : uint<64> = truncate<64>(dst_address + byte_offset)
+    next_index_wide : u17 = truncate<17>(extend<17>(index) + 1)
+    last_word : bit = next_index_wide >= extend<17>(word_count)
+    target_index : u16 = truncate<16>(target)
+    src0_value : s32 = bitcast<s32>(ub_read0_data)
+    src1_value : s32 = bitcast<s32>(ub_read1_data)
+
+    reduction_fire : bit = reduction_loop_state & ub_read0_ready
+    reduction_sum_next : s64 = truncate<64>(
+        reduction_accumulator + extend<64>(src0_value)
+    )
+    reduction_max_include : bit = (operation != 10) | (index < target_index)
+    reduction_max_next : s32 = mux(
+        reduction_max_include & (src0_value > reduction_maximum),
+        src0_value,
+        reduction_maximum
+    )
+    reduction_is_softmax : bit = (operation == 4) | (operation == 10)
+
+    exp_is_causal : bit = operation == 10
+    exp_is_softmax : bit = (operation == 4) | exp_is_causal
+    exp_is_active : bit = (~exp_is_causal) | (index < target_index)
+    exp_centered : s32 = mux(
+        exp_is_softmax & exp_is_active,
+        ztpu_vmu_sat_sub_s32(src0_value, softmax_maximum),
+        src0_value
+    )
+    exp_clamped : s32 = mux(
+        exp_centered > 0,
+        0,
+        mux(exp_centered < -524288, -524288, exp_centered)
+    )
+    exp_distance : u32 = bitcast<u32>(truncate<32>(0 - extend<33>(exp_clamped)))
+    exp_index_raw : u11 = truncate<11>(exp_distance >> 9)
+    exp_index : u10 = mux(exp_index_raw > 1023, 1023, truncate<10>(exp_index_raw))
+    exp_request_fire : bit = exp_request_state & ub_read0_ready
+    exp_write_data : u32 = mux(exp_is_softmax & (~exp_is_active), 0, exp_word)
+    exp_write_fire : bit = exp_write_state & ub_write_ready
+    softmax_sum_next : u32 = mux(
+        exp_is_softmax & exp_is_active,
+        truncate<32>(softmax_sum + exp_word),
+        softmax_sum
+    )
+
+    normalize_active : bit = (~exp_is_causal) | (index < target_index)
+    normalized_value : s32 = mux(
+        normalize_active,
+        ztpu_vmu_sat_mul_q16_s32(src0_value, softmax_inverse),
+        0
+    )
+    normalize_write_valid : bit = softmax_normalize_state & ub_read0_ready
+    normalize_write_fire : bit = normalize_write_valid & ub_write_ready
+
+    bwd_target_value : s32 = mux(
+        index == target_index,
+        ztpu_vmu_sat_sub_s32(src0_value, 65536),
+        src0_value
+    )
+    bwd_target_write_valid : bit = softmax_bwd_target_state & ub_read0_ready
+    bwd_target_write_fire : bit = bwd_target_write_valid & ub_write_ready
+
+    softmax_dot_read_fire : bit = softmax_dot_loop_state &
+        ub_read0_ready & ub_read1_ready
+    softmax_dot_product : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, src1_value)
+    softmax_dot_sum_next : s64 = truncate<64>(
+        softmax_dot_accumulator + extend<64>(softmax_dot_product)
+    )
+    softmax_difference : s32 = ztpu_vmu_sat_sub_s32(src1_value, softmax_dot)
+    softmax_backward_value : s32 = ztpu_vmu_sat_mul_q16_s32(
+        src0_value, softmax_difference
+    )
+    softmax_backward_write_valid : bit = softmax_backward_state &
+        ub_read0_ready & ub_read1_ready
+    softmax_backward_write_fire : bit = softmax_backward_write_valid & ub_write_ready
+
+    rms_sumsq_fire : bit = rms_sumsq_loop_state & ub_read0_ready
+    rms_square : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, src0_value)
+    rms_sumsq_next : s64 = truncate<64>(
+        reduction_accumulator + extend<64>(rms_square)
+    )
+    rms_sumsq_s32 : s32 = ztpu_vmu_sat_s32_from_s64(rms_sumsq_next)
+    rms_mean_square : s32 = ztpu_vmu_sat_mul_q16_s32(
+        rms_sumsq_s32, inverse_length
+    )
+    rms_input_signed : s32 = ztpu_vmu_sat_add_s32(rms_mean_square, epsilon)
+    rms_input_positive : u32 = mux(
+        rms_input_signed <= 0, 1, bitcast<u32>(rms_input_signed)
+    )
+    rms_forward_value : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, rms_r)
+    rms_forward_write_valid : bit = rms_forward_state & ub_read0_ready
+    rms_forward_write_fire : bit = rms_forward_write_valid & ub_write_ready
+
+    rms_dot_read_fire : bit = rms_dot_loop_state & ub_read0_ready & ub_read1_ready
+    rms_dot_product : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, src1_value)
+    rms_dot_sum_next : s64 = truncate<64>(
+        dot_accumulator + extend<64>(rms_dot_product)
+    )
+    rms_dot_s32 : s32 = ztpu_vmu_sat_s32_from_s64(rms_dot_sum_next)
+    rms_mean_dot_next : s32 = ztpu_vmu_sat_mul_q16_s32(
+        rms_dot_s32, inverse_length
+    )
+    rms_term_next : s32 = ztpu_vmu_sat_mul_q16_s32(rms_r3, rms_mean_dot_next)
+    rms_dy_scaled : s32 = ztpu_vmu_sat_mul_q16_s32(src1_value, rms_r)
+    rms_x_term : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, rms_term)
+    rms_backward_value : s32 = ztpu_vmu_sat_sub_s32(rms_dy_scaled, rms_x_term)
+    rms_backward_write_valid : bit = rms_backward_state &
+        ub_read0_ready & ub_read1_ready
+    rms_backward_write_fire : bit = rms_backward_write_valid & ub_write_ready
+
+    log_positive_x : u32 = mux(src0_value <= 0, 1, bitcast<u32>(src0_value))
+    log_msb : u6 = ztpu_msb_index_u32(bitcast<bits<32>>(log_positive_x))
+    log_exponent_next : s7 = truncate<7>(extend<7>(bitcast<s6>(log_msb)) - 15)
+    log_exponent_negative : bit = bitcast<bits<7>>(log_exponent_next)[6]
+    log_exponent_abs : u6 = mux(
+        log_exponent_negative,
+        bitcast<u6>(truncate<6>(0 - log_exponent_next)),
+        bitcast<u6>(truncate<6>(log_exponent_next))
+    )
+    log_shifted_x : u32 = mux(
+        log_exponent_negative,
+        truncate<32>(log_positive_x << log_exponent_abs),
+        log_positive_x >> log_exponent_abs
+    )
+    log_normalized_x : u32 = mux(
+        log_shifted_x < 32768,
+        32768,
+        mux(log_shifted_x >= 65536, 65535, log_shifted_x)
+    )
+    log_index : u8 = truncate<8>((log_normalized_x - 32768) >> 7)
+    log_request_fire : bit = log_request_state & ub_read0_ready
+    log_exponent_product : s64 = extend<32>(log_exponent) * 45426
+    log_exponent_term : s32 = ztpu_vmu_sat_s32_from_s64(log_exponent_product)
+    log_result : s32 = ztpu_vmu_sat_add_s32(
+        bitcast<s32>(log_word), log_exponent_term
+    )
+    log_write_fire : bit = log_write_state & ub_write_ready
+
+    elementwise_state : bit = relu_state | add_state | scale_state |
+        relu_backward_state
+    elementwise_dual_read : bit = add_state | relu_backward_state
+    elementwise_ready : bit = ub_read0_ready &
+        mux(elementwise_dual_read, ub_read1_ready, 1)
+    elementwise_write_valid : bit = elementwise_state & elementwise_ready
+    elementwise_write_fire : bit = elementwise_write_valid & ub_write_ready
+    relu_value : s32 = mux(src0_value < 0, 0, src0_value)
+    add_value : s32 = ztpu_vmu_sat_add_s32(src0_value, src1_value)
+    scale_value : s32 = ztpu_vmu_sat_mul_q16_s32(src0_value, epsilon)
+    relu_backward_value : s32 = mux(src0_value > 0, src1_value, 0)
+    elementwise_value : s32 = mux(
+        relu_state,
+        relu_value,
+        mux(add_state, add_value, mux(scale_state, scale_value, relu_backward_value))
+    )
+
+    q8_valid_lanes : u3 = truncate<3>(packed_control)
+    q8_lane_stride : u24 = truncate<24>(packed_control >> 8)
+    q8_row_offset : uint<64> = truncate<64>(
+        extend<64>(index) * extend<64>(target)
+    )
+    q8_lane_offset : uint<64> = extend<64>(
+        truncate<27>(extend<27>(q8_lane) * extend<27>(q8_lane_stride))
+    )
+    q8_src_address : uint<64> = truncate<64>(
+        src0_address + q8_row_offset + q8_lane_offset
+    )
+    q8_requant.enable = 1
+    q8_requant.scale = epsilon
+    q8_requant.shift = bitcast<u6>(bitcast<bits<32>>(inverse_length)[5:0])
+    q8_requant.zero_point = 0
+    q8_requant.value = src0_value
+    q8_raw_code : u8 = bitcast<u8>(bitcast<bits<8>>(q8_requant.result))
+    q8_code : u8 = mux(q8_raw_code == 128, 129, q8_raw_code)
+    q8_lane_word : u32 = mux(
+        q8_lane == 0,
+        extend<32>(q8_code),
+        mux(q8_lane == 1,
+            truncate<32>(extend<32>(q8_code) << 8),
+            mux(q8_lane == 2,
+                truncate<32>(extend<32>(q8_code) << 16),
+                mux(q8_lane == 3,
+                    truncate<32>(extend<32>(q8_code) << 24), 0)))
+    )
+    q8_word_next : u32 = q8_word | q8_lane_word
+    q8_lane_next : u4 = truncate<4>(extend<4>(q8_lane) + 1)
+    q8_last_lane : bit = q8_lane_next >= extend<4>(q8_valid_lanes)
+    q8_read_fire : bit = q8_pack_read_state & ub_read0_ready
+    q8_write_fire : bit = q8_pack_write_state & ub_write_ready
+
+    reduction_done_write : bit = done_state &
+        ((operation == 2) | (operation == 3))
+    reduction_done_fire : bit = reduction_done_write & ub_write_ready
+    reduction_done_value : s32 = mux(
+        operation == 2,
+        ztpu_vmu_sat_s32_from_s64(reduction_accumulator),
+        reduction_maximum
+    )
+
+    exp_lut.request = exp_request_fire
+    exp_lut.address = exp_index
+    ln_lut.request = log_request_fire
+    ln_lut.address = log_index
+    reciprocal.start = softmax_recip_start_state
+    reciprocal.x = mux(softmax_sum == 0, 1, softmax_sum)
+    rsqrt.start = rms_rsqrt_start_state
+    rsqrt.x = rsqrt_input
+
+    index_reset : bit = start_accepted | reduction_init_state |
+        (reduction_fire & last_word) |
+        (exp_write_fire & last_word & exp_is_softmax) |
+        (softmax_recip_wait_state & reciprocal.done) |
+        softmax_dot_init_state |
+        (softmax_dot_read_fire & last_word) |
+        rms_sumsq_init_state |
+        (rms_sumsq_fire & last_word) |
+        (rms_rsqrt_wait_state & rsqrt.done) |
+        rms_dot_init_state |
+        (rms_dot_read_fire & last_word)
+    index_advance : bit =
+        (reduction_fire & (~last_word)) |
+        (exp_write_fire & (~last_word)) |
+        (normalize_write_fire & (~last_word)) |
+        (bwd_target_write_fire & (~last_word)) |
+        (softmax_dot_read_fire & (~last_word)) |
+        (softmax_backward_write_fire & (~last_word)) |
+        (rms_sumsq_fire & (~last_word)) |
+        (rms_forward_write_fire & (~last_word)) |
+        (rms_dot_read_fire & (~last_word)) |
+        (rms_backward_write_fire & (~last_word)) |
+        (log_write_fire & (~last_word)) |
+        (elementwise_write_fire & (~last_word)) |
+        (q8_write_fire & (~last_word))
+
+    index <- mux(
+        index_reset,
+        0,
+        mux(index_advance, truncate<16>(index + 1), index)
+    )
+    operation <- mux(start_accepted, op, operation)
+    src0_address <- mux(start_accepted, src0_base, src0_address)
+    src1_address <- mux(start_accepted, src1_base, src1_address)
+    dst_address <- mux(start_accepted, dst_base, dst_address)
+    word_count <- mux(start_accepted, length, word_count)
+    epsilon <- mux(start_accepted, scalar0, epsilon)
+    inverse_length <- mux(start_accepted, scalar1, inverse_length)
+    target <- mux(start_accepted, scalar2, target)
+    packed_control <- mux(start_accepted, scalar3, packed_control)
+    reduction_accumulator <- mux(
+        start_accepted | reduction_init_state | rms_sumsq_init_state,
+        0,
+        mux(reduction_fire, reduction_sum_next,
+            mux(rms_sumsq_fire, rms_sumsq_next, reduction_accumulator))
+    )
+    reduction_maximum <- mux(
+        start_accepted | reduction_init_state,
+        -2147483648,
+        mux(reduction_fire, reduction_max_next, reduction_maximum)
+    )
+    softmax_maximum <- mux(
+        reduction_fire & last_word & reduction_is_softmax,
+        reduction_max_next,
+        softmax_maximum
+    )
+    softmax_sum <- mux(
+        start_accepted | (reduction_fire & last_word & reduction_is_softmax),
+        0,
+        mux(exp_write_fire, softmax_sum_next, softmax_sum)
+    )
+    exp_word <- mux(exp_wait_state & exp_lut.data_valid, exp_lut.data, exp_word)
+    softmax_inverse <- mux(
+        softmax_recip_wait_state & reciprocal.done,
+        bitcast<s32>(reciprocal.y),
+        softmax_inverse
+    )
+    softmax_dot_accumulator <- mux(
+        softmax_dot_init_state,
+        0,
+        mux(softmax_dot_read_fire, softmax_dot_sum_next,
+            softmax_dot_accumulator)
+    )
+    softmax_dot <- mux(
+        softmax_dot_read_fire & last_word,
+        ztpu_vmu_sat_s32_from_s64(softmax_dot_sum_next),
+        softmax_dot
+    )
+    rsqrt_input <- mux(
+        rms_sumsq_fire & last_word,
+        rms_input_positive,
+        rsqrt_input
+    )
+    rms_r <- mux(
+        rms_rsqrt_wait_state & rsqrt.done,
+        bitcast<s32>(rsqrt.y),
+        rms_r
+    )
+    rms_r2 <- mux(
+        rms_rsqrt_wait_state & rsqrt.done,
+        ztpu_vmu_sat_mul_q16_s32(bitcast<s32>(rsqrt.y), bitcast<s32>(rsqrt.y)),
+        rms_r2
+    )
+    rms_r3 <- mux(
+        rms_rsqrt_wait_state & rsqrt.done,
+        ztpu_vmu_sat_mul_q16_s32(
+            ztpu_vmu_sat_mul_q16_s32(
+                bitcast<s32>(rsqrt.y), bitcast<s32>(rsqrt.y)
+            ),
+            bitcast<s32>(rsqrt.y)
+        ),
+        rms_r3
+    )
+    dot_accumulator <- mux(
+        rms_dot_init_state,
+        0,
+        mux(rms_dot_read_fire, rms_dot_sum_next, dot_accumulator)
+    )
+    mean_dot <- mux(
+        rms_dot_read_fire & last_word,
+        rms_mean_dot_next,
+        mean_dot
+    )
+    rms_term <- mux(
+        rms_dot_read_fire & last_word,
+        rms_term_next,
+        rms_term
+    )
+    log_exponent <- mux(log_request_fire, log_exponent_next, log_exponent)
+    log_word <- mux(log_wait_state & ln_lut.data_valid, ln_lut.data, log_word)
+    q8_lane <- mux(
+        start_accepted | (q8_write_fire & (~last_word)),
+        0,
+        mux(q8_read_fire & (~q8_last_lane), truncate<3>(q8_lane + 1), q8_lane)
+    )
+    q8_word <- mux(
+        start_accepted | (q8_write_fire & (~last_word)),
+        0,
+        mux(q8_read_fire, q8_word_next, q8_word)
+    )
+
+    read0_for_dst : bit = softmax_normalize_state
+    dual_read_state : bit = softmax_dot_loop_state | softmax_backward_state |
+        rms_dot_loop_state | rms_backward_state | add_state | relu_backward_state
+    read0_state : bit = reduction_loop_state | exp_request_state |
+        softmax_normalize_state | softmax_bwd_target_state |
+        softmax_dot_loop_state | softmax_backward_state |
+        rms_sumsq_loop_state | rms_forward_state | rms_dot_loop_state |
+        rms_backward_state | log_request_state | elementwise_state
+    ub_read0_valid = read0_state | q8_pack_read_state
+    ub_read0_addr = mux(
+        q8_pack_read_state, q8_src_address,
+        mux(read0_for_dst, dst_indexed, src0_indexed)
+    )
+    ub_read1_valid = dual_read_state
+    ub_read1_addr = src1_indexed
+
+    ub_write_valid = exp_write_state | normalize_write_valid |
+        bwd_target_write_valid | softmax_backward_write_valid |
+        rms_forward_write_valid | rms_backward_write_valid |
+        log_write_state | elementwise_write_valid | q8_pack_write_state |
+        reduction_done_write
+    ub_write_addr = mux(reduction_done_write, dst_address, dst_indexed)
+    ub_write_data = bitcast<bits<32>>(
+        mux(exp_write_state, bitcast<s32>(exp_write_data),
+        mux(softmax_normalize_state, normalized_value,
+        mux(softmax_bwd_target_state, bwd_target_value,
+        mux(softmax_backward_state, softmax_backward_value,
+        mux(rms_forward_state, rms_forward_value,
+        mux(rms_backward_state, rms_backward_value,
+        mux(log_write_state, log_result,
+        mux(elementwise_state, elementwise_value,
+        mux(q8_pack_write_state, bitcast<s32>(q8_word),
+            reduction_done_value)))))))))
+    )
+    ub_write_mask = 15
+    busy = ~idle
+    done = done_state
+    error = 0
+
+    fsm phase : ZtpuUbVmuPhase = Idle {
+        Idle {
+            priority {
+                when start_accepted & (op == 0) -> ExpRequest {}
+                when start_accepted & (op == 1) -> LogRequest {}
+                when start_accepted &
+                    ((op == 2) | (op == 3) | (op == 4) | (op == 10)) -> ReductionInit {}
+                when start_accepted & (op == 5) -> SoftmaxBwdTarget {}
+                when start_accepted & ((op == 6) | (op == 7)) -> RmsSumsqInit {}
+                when start_accepted & (op == 8) -> SoftmaxDotInit {}
+                when start_accepted & (op == 9) -> Relu {}
+                when start_accepted & (op == 11) -> Add {}
+                when start_accepted & (op == 12) -> Scale {}
+                when start_accepted & (op == 13) -> ReluBackward {}
+                when start_accepted & (op == 14) -> Q8PackRead {}
+                when start_accepted -> Done {}
+            }
+        }
+        ReductionInit { -> ReductionLoop {} }
+        ReductionLoop {
+            priority {
+                when reduction_fire & last_word & reduction_is_softmax -> ExpRequest {}
+                when reduction_fire & last_word -> Done {}
+            }
+        }
+        ExpRequest { when exp_request_fire -> ExpWait {} }
+        ExpWait { when exp_lut.data_valid -> ExpWrite {} }
+        ExpWrite {
+            priority {
+                when exp_write_fire & last_word & exp_is_softmax -> SoftmaxRecipStart {}
+                when exp_write_fire & last_word -> Done {}
+                when exp_write_fire -> ExpRequest {}
+            }
+        }
+        SoftmaxRecipStart { -> SoftmaxRecipWait {} }
+        SoftmaxRecipWait { when reciprocal.done -> SoftmaxNormalize {} }
+        SoftmaxNormalize { when normalize_write_fire & last_word -> Done {} }
+        SoftmaxBwdTarget { when bwd_target_write_fire & last_word -> Done {} }
+        SoftmaxDotInit { -> SoftmaxDotLoop {} }
+        SoftmaxDotLoop {
+            when softmax_dot_read_fire & last_word -> SoftmaxBackward {}
+        }
+        SoftmaxBackward {
+            when softmax_backward_write_fire & last_word -> Done {}
+        }
+        RmsSumsqInit { -> RmsSumsqLoop {} }
+        RmsSumsqLoop { when rms_sumsq_fire & last_word -> RmsRsqrtStart {} }
+        RmsRsqrtStart { -> RmsRsqrtWait {} }
+        RmsRsqrtWait {
+            priority {
+                when rsqrt.done & (operation == 6) -> RmsForward {}
+                when rsqrt.done -> RmsDotInit {}
+            }
+        }
+        RmsForward { when rms_forward_write_fire & last_word -> Done {} }
+        RmsDotInit { -> RmsDotLoop {} }
+        RmsDotLoop { when rms_dot_read_fire & last_word -> RmsBackward {} }
+        RmsBackward { when rms_backward_write_fire & last_word -> Done {} }
+        LogRequest { when log_request_fire -> LogWait {} }
+        LogWait { when ln_lut.data_valid -> LogWrite {} }
+        LogWrite {
+            priority {
+                when log_write_fire & last_word -> Done {}
+                when log_write_fire -> LogRequest {}
+            }
+        }
+        Relu { when elementwise_write_fire & last_word -> Done {} }
+        Add { when elementwise_write_fire & last_word -> Done {} }
+        Scale { when elementwise_write_fire & last_word -> Done {} }
+        ReluBackward { when elementwise_write_fire & last_word -> Done {} }
+        Q8PackRead { when q8_read_fire & q8_last_lane -> Q8PackWrite {} }
+        Q8PackWrite {
+            priority {
+                when q8_write_fire & last_word -> Done {}
+                when q8_write_fire -> Q8PackRead {}
+            }
+        }
+        Done {
+            priority {
+                when reduction_done_write & ub_write_ready -> Idle {}
+                when !reduction_done_write -> Idle {}
+            }
+        }
+    }
+}

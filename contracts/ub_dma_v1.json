@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_dma_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUnifiedBufferDma64x32",
+  "address_width": 64,
+  "data_width": 32,
+  "length_width": 16,
+  "length_unit": "bytes",
+  "max_burst_beats": 4,
+  "axi_profile": "single_outstanding_incrementing_full_width",
+  "directions": ["dram_to_ub", "ub_to_dram"],
+  "error_codes": {
+    "unaligned_or_zero_length": 1,
+    "axi_read_response": 2,
+    "axi_write_response": 3
+  },
+  "excluded": [
+    "dram_to_dram_copy",
+    "command_descriptor_decode",
+    "multiple_outstanding_transactions",
+    "axi_ids"
+  ],
+  "timing": "cycle_exact"
+}

@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "contract": "ztpu_dma_fault_latch_v1",
+  "source_language": "zlang",
+  "top": "ZtpuDmaFenceFaultLatch64",
+  "record": ["write", "master", "address", "burst_length", "burst_size"],
+  "policy": "preserve_first_fault_and_latch_overflow_on_later_faults",
+  "fault_priority": "fault_over_clear",
+  "clear_valid_also_clears_overflow": true,
+  "verification": "direct_first_fault_overflow_and_clear_test"
+}

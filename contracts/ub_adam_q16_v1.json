@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_adam_q16_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbAdamQ16",
+  "address_width": 64,
+  "data_width": 32,
+  "count_width": 16,
+  "fixed_point": "Q16.16",
+  "newton_raphson_iterations": 2,
+  "updates": ["weight", "first_moment", "second_moment"],
+  "bias_correction": "persistent_b1t_b2t_with_atomic_clear_and_start",
+  "unified_buffer": {
+    "read_ports": 2,
+    "write_ports": 1,
+    "addressing": "byte_addressed_32_bit_words",
+    "access_order": ["read_m_and_gradient", "read_v_and_weight", "write_m", "write_v", "write_weight"]
+  },
+  "zero_length_behavior": "update_bias_powers_without_memory_traffic",
+  "error_behavior": "always_zero_for_legal_q16_contract",
+  "timing": "cycle_exact_under_independent_ub_stalls"
+}

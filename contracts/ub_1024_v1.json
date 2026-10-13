@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "contract": "ztpu_unified_buffer_1024_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUnifiedBuffer1024x32",
+  "data_width": 32,
+  "address_width": 64,
+  "logical_depth_words": 1024,
+  "banks": 4,
+  "read_ports": 2,
+  "write_ports": 1,
+  "write_mask_lanes": 4,
+  "read_latency_cycles": 0,
+  "write_commit": "rising_edge",
+  "collision": "read_first",
+  "reset_contents": "preserve",
+  "addressing": "low_10_bits_of_byte_address_shifted_right_2",
+  "consumer": "ZtpuQueuedQ16AhbTop4x4 TinyCar profile"
+}

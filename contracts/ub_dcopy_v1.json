@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "contract": "ztpu_ub_dcopy_v1",
+  "source_language": "zlang",
+  "top": "ZtpuUbDcopy64x32",
+  "address_width": 64,
+  "data_width": 32,
+  "row_bytes_width": 16,
+  "row_count_width": 32,
+  "stride_width": 64,
+  "copy_order": "load_one_row_to_ub_then_store_one_row_to_dram",
+  "source_and_destination_stride_unit": "bytes",
+  "zero_length_behavior": "zero_rows_or_zero_row_bytes_complete_without_dma_traffic",
+  "error_behavior": "stop_on_first_row_load_or_store_dma_error_and_preserve_error_code",
+  "overlap_behavior": "sequential_row_order_with_each_source_row_buffered_in_ub_before_its_store",
+  "timing": "cycle_exact_controller_protocol"
+}
